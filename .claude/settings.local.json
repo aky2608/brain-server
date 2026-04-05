@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo systemctl:*)",
+      "Bash(python3:*)",
+      "Bash(sudo mkdir:*)",
+      "Bash(systemctl restart:*)",
+      "Bash(systemctl --user restart brain)",
+      "Bash(sed -i 's|Back to brain\\\\.zerotobuilt\\\\.in|Back to zerotobuilt.in|g; s|← brain\\\\.zerotobuilt\\\\.in|← zerotobuilt.in|g; s|brain\\\\.zerotobuilt\\\\.in$|zerotobuilt.in|g' /var/www/planner/index.html /var/www/health/index.html /var/www/music/index.html)",
+      "Read(//var/www/health/**)"
+    ]
+  }
+}
