@@ -8,6 +8,8 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BRAIN_API = "https://api.zerotobuilt.in"
 ALLOWED_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+API_KEY = os.getenv("API_KEY", "631510f78e3cec7d45a27036be924ba432b33a2d64d822b1b4897ce03c7777ae")
+BRAIN_HEADERS = {"X-API-Key": API_KEY}
 TG_BASE = f"https://api.telegram.org/bot{TOKEN}"
 
 
@@ -29,6 +31,7 @@ async def send_message(chat_id: int, text: str):
 async def capture_to_brain(content: str, source: str = "telegram", capture_type: str = "text") -> dict:
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(f"{BRAIN_API}/capture",
+                              headers=BRAIN_HEADERS,
                               json={"content": content, "source": source,
                                     "capture_type": capture_type})
         return r.json()
@@ -59,7 +62,7 @@ async def main():
 
                 if text == "/status":
                     async with httpx.AsyncClient() as client:
-                        r = await client.get(f"{BRAIN_API}/items")
+                        r = await client.get(f"{BRAIN_API}/items", headers=BRAIN_HEADERS)
                         count = r.json().get("count", 0)
                     await send_message(chat_id, f"🧠 Brain has *{count}* captures so far.")
                     continue

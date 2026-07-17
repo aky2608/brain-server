@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+dummy.m4a
+*.m4a

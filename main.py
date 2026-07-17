@@ -9,13 +9,30 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
+import whisper
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Security, UploadFile
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import Client, create_client
 
 load_dotenv()
+API_KEY = os.getenv("API_KEY")
+if not API_KEY:
+    raise RuntimeError("API_KEY not set")
+
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def verify_api_key(api_key: str = Security(api_key_header)):
+    if api_key == API_KEY:
+        return api_key
+    raise HTTPException(
+        status_code=403,
+        detail="Invalid or missing API key"
+    )
+
 
 supabase: Client = create_client(
     os.getenv("SUPABASE_URL"),
@@ -316,6 +333,9 @@ async def batch_classification_loop():
                     supabase.table("items").update({"classification_status": "queued"}).eq("id", item_id).execute()
 
 
+whisper_model = whisper.load_model("tiny")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(batch_classification_loop())
@@ -339,7 +359,7 @@ async def health():
     return {"status": "brain is alive", "model": ONEMIN_MODEL}
 
 
-@app.post("/capture")
+@app.post("/capture", dependencies=[Depends(verify_api_key)])
 async def capture(data: CaptureInput, bg: BackgroundTasks):
     is_active = data.source in ACTIVE_SOURCES
     content = data.content
@@ -392,7 +412,7 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
     return {"status": "captured", "id": item_id, "path": "instant" if is_active else "queued", "capture_type": capture_type}
 
 
-@app.get("/items")
+@app.get("/items", dependencies=[Depends(verify_api_key)])
 async def get_items(
     q: Optional[str] = None,
     cat: Optional[str] = None,
@@ -415,7 +435,7 @@ async def get_items(
     return {"items": items, "count": len(items)}
 
 
-@app.get("/items/{item_id}")
+@app.get("/items/{item_id}", dependencies=[Depends(verify_api_key)])
 async def get_item(item_id: str):
     result = supabase.table("items").select("*").eq("id", item_id).single().execute()
     if not result.data:
@@ -423,7 +443,7 @@ async def get_item(item_id: str):
     return result.data
 
 
-@app.patch("/items/{item_id}")
+@app.patch("/items/{item_id}", dependencies=[Depends(verify_api_key)])
 async def update_item(item_id: str, updates: dict):
     allowed = {"category", "subcategory", "ai_tags", "task_status",
                "task_deadline", "task_progress", "plan_bucket",
@@ -435,7 +455,7 @@ async def update_item(item_id: str, updates: dict):
     return result.data[0]
 
 
-@app.get("/tasks")
+@app.get("/tasks", dependencies=[Depends(verify_api_key)])
 async def get_tasks(status: Optional[str] = None):
     query = supabase.table("items").select("*").eq("action_class", "task")
     if status:
@@ -458,7 +478,7 @@ async def get_tasks(status: Optional[str] = None):
     return {"tasks": tasks}
 
 
-@app.get("/planner/counts")
+@app.get("/planner/counts", dependencies=[Depends(verify_api_key)])
 async def get_planner_counts():
     counts = {}
     for b in ("today", "this_week", "this_month", "someday"):
@@ -470,7 +490,7 @@ async def get_planner_counts():
     return counts
 
 
-@app.get("/planner")
+@app.get("/planner", dependencies=[Depends(verify_api_key)])
 async def get_planner(bucket: Optional[str] = None):
     query = supabase.table("items").select("*")
     if bucket:
@@ -485,7 +505,7 @@ class MovePlannerInput(BaseModel):
     bucket: str
 
 
-@app.patch("/planner/{item_id}/move")
+@app.patch("/planner/{item_id}/move", dependencies=[Depends(verify_api_key)])
 async def move_planner(item_id: str, body: MovePlannerInput):
     bucket = body.bucket
     valid = {"today", "this_week", "this_month", "someday", "unplanned"}
@@ -496,7 +516,7 @@ async def move_planner(item_id: str, body: MovePlannerInput):
     }).eq("id", item_id).execute()
     return result.data[0]
 
-@app.post("/upload")
+@app.post("/upload", dependencies=[Depends(verify_api_key)])
 async def upload_pdf(bg: BackgroundTasks, file: UploadFile = File(...), source: str = "web_upload"):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported")
@@ -538,7 +558,7 @@ class JournalInput(BaseModel):
     content: str
 
 
-@app.post("/journal")
+@app.post("/journal", dependencies=[Depends(verify_api_key)])
 async def journal(data: JournalInput):
     if not (1 <= data.mood_score <= 5 and 1 <= data.energy_score <= 5):
         raise HTTPException(400, "mood_score and energy_score must be between 1 and 5")
@@ -560,7 +580,7 @@ async def journal(data: JournalInput):
     return {"status": "saved", "id": item_id}
 
 
-@app.get("/finance")
+@app.get("/finance", dependencies=[Depends(verify_api_key)])
 async def get_finance():
     # Fetch category+subcategory matches
     r1 = supabase.table("items").select("*")\
@@ -605,37 +625,44 @@ async def get_finance():
     return {"items": items, "monthly": monthly}
 
 
-@app.post("/upload-audio")
+@app.post("/upload-audio", dependencies=[Depends(verify_api_key)])
 async def upload_audio(
     file: UploadFile = File(...),
     source: str = Form("app_voice"),
     capture_type: str = Form("voice"),
     bg: BackgroundTasks = BackgroundTasks()
 ):
-    import tempfile
     content = await file.read()
 
-    with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as tmp:
+    suffix = os.path.splitext(file.filename or "audio.m4a")[1] or ".m4a"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(content)
         tmp_path = tmp.name
 
+    try:
+        loop = asyncio.get_event_loop()
+        result_w = await loop.run_in_executor(None, lambda: whisper_model.transcribe(tmp_path))
+        transcript = result_w["text"].strip()
+    finally:
+        os.unlink(tmp_path)
+
+    is_active = source in ACTIVE_SOURCES
     result = supabase.table("items").insert({
-        "raw_content": f"[Voice memo — {len(content)} bytes — transcription pending]",
+        "raw_content": transcript,
         "source": source,
         "capture_type": capture_type,
-        "classification_status": "queued",
-        "metadata": {"audio_size": len(content), "format": "m4a"}
+        "classification_status": "instant" if is_active else "queued",
+        "metadata": {"audio_size": len(content), "format": suffix.lstrip(".")}
     }).execute()
 
     item_id = result.data[0]["id"]
+    if is_active:
+        bg.add_task(classify_single, item_id)
 
-    import os
-    os.unlink(tmp_path)
-
-    return {"status": "captured", "id": item_id}
+    return {"status": "captured", "id": item_id, "transcript": transcript}
 
 
-@app.delete("/items/{item_id}")
+@app.delete("/items/{item_id}", dependencies=[Depends(verify_api_key)])
 async def delete_item(item_id: str):
     supabase.table("items").update({"status": "deleted"}).eq("id", item_id).execute()
     return {"status": "deleted"}
