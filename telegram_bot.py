@@ -8,7 +8,9 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BRAIN_API = "https://api.zerotobuilt.in"
 ALLOWED_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
-API_KEY = os.getenv("API_KEY", "631510f78e3cec7d45a27036be924ba432b33a2d64d822b1b4897ce03c7777ae")
+API_KEY = os.getenv("API_KEY")
+if not API_KEY:
+    raise RuntimeError("API_KEY not set")
 BRAIN_HEADERS = {"X-API-Key": API_KEY}
 TG_BASE = f"https://api.telegram.org/bot{TOKEN}"
 

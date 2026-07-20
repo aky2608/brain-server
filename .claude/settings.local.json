@@ -11,7 +11,9 @@
       "Bash(systemctl status:*)",
       "Bash(pip install:*)",
       "Bash(jobs:*)",
-      "Bash(pip3 install:*)"
+      "Bash(pip3 install:*)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
