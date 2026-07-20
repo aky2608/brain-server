@@ -1,14 +1,18 @@
 import asyncio
 import io
 import json
+import logging
 import os
 import re
 import subprocess
 import tempfile
+import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
 import httpx
+from starlette.requests import Request
 import whisper
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Security, UploadFile
@@ -18,6 +22,24 @@ from pydantic import BaseModel
 from supabase import Client, create_client
 
 load_dotenv()
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "msg": record.getMessage(),
+            **getattr(record, "ctx", {}),
+        })
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonFormatter())
+logger = logging.getLogger("brain")
+logger.setLevel(logging.INFO)
+logger.addHandler(_handler)
+logger.propagate = False
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY not set")
@@ -344,6 +366,22 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Brain API", version="1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    rid = uuid.uuid4().hex[:8]
+    t0 = time.monotonic()
+    response = await call_next(request)
+    logger.info("request", extra={"ctx": {
+        "request_id": rid,
+        "path": request.url.path,
+        "method": request.method,
+        "status": response.status_code,
+        "latency_ms": round((time.monotonic() - t0) * 1000),
+    }})
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,

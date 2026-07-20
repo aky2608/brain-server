@@ -1,0 +1,18 @@
+[Unit]
+Description=Brain Telegram bot
+After=network.target brain-api.service
+
+[Service]
+Type=simple
+User=ashish
+WorkingDirectory=/opt/brain
+EnvironmentFile=/opt/brain/.env
+ExecStart=/opt/brain/venv/bin/python /opt/brain/telegram_bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=brain-telegram
+
+[Install]
+WantedBy=multi-user.target
