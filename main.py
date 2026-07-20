@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -16,6 +17,7 @@ from starlette.requests import Request
 import whisper
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Security, UploadFile
+from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -355,11 +357,20 @@ async def batch_classification_loop():
                     supabase.table("items").update({"classification_status": "queued"}).eq("id", item_id).execute()
 
 
-whisper_model = whisper.load_model("tiny")
+_model_ready: bool = False
+whisper_model = None
+
+
+async def _load_whisper():
+    global whisper_model, _model_ready
+    loop = asyncio.get_event_loop()
+    whisper_model = await loop.run_in_executor(None, lambda: whisper.load_model("tiny"))
+    _model_ready = True
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    asyncio.create_task(_load_whisper())
     task = asyncio.create_task(batch_classification_loop())
     yield
     task.cancel()
@@ -394,7 +405,49 @@ app.add_middleware(
 
 @app.get("/health")
 async def health():
-    return {"status": "brain is alive", "model": ONEMIN_MODEL}
+    checks: dict = {}
+    failed: list[str] = []
+
+    if not _model_ready:
+        checks["whisper"] = {"status": "critical", "detail": "model still loading"}
+        failed.append("whisper")
+    else:
+        checks["whisper"] = {"status": "ok"}
+
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("items").select("id").limit(1).execute()
+        )
+        checks["postgres"] = {"status": "ok"}
+    except Exception:
+        checks["postgres"] = {"status": "critical", "detail": "unreachable"}
+        failed.append("postgres")
+
+    try:
+        await asyncio.to_thread(
+            lambda: supabase.table("items").select("embedding").limit(1).execute()
+        )
+        checks["pgvector"] = {"status": "ok"}
+    except Exception:
+        checks["pgvector"] = {"status": "critical", "detail": "vector type unavailable"}
+        failed.append("pgvector")
+
+    disk = shutil.disk_usage("/")
+    free_gb = round(disk.free / 1024**3, 1)
+    checks["disk"] = {
+        "status": "warn" if free_gb < 2.0 else "ok",
+        "free_gb": free_gb,
+        "total_gb": round(disk.total / 1024**3, 1),
+    }
+
+    return JSONResponse(
+        status_code=503 if failed else 200,
+        content={
+            "status": "degraded" if failed else "ok",
+            "failed": failed,
+            "checks": checks,
+        },
+    )
 
 
 @app.post("/capture", dependencies=[Depends(verify_api_key)])
@@ -670,6 +723,9 @@ async def upload_audio(
     capture_type: str = Form("voice"),
     bg: BackgroundTasks = BackgroundTasks()
 ):
+    if not _model_ready:
+        raise HTTPException(status_code=503, detail="whisper model loading")
+
     content = await file.read()
 
     suffix = os.path.splitext(file.filename or "audio.m4a")[1] or ".m4a"
