@@ -242,14 +242,21 @@ async def fetch_youtube_transcript(url: str) -> str:
         yt_dlp_path = "yt-dlp"
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        result = subprocess.run(
-            [yt_dlp_path, "--write-auto-sub", "--sub-lang", "en", "--skip-download",
-             "--sub-format", "vtt", "-o", os.path.join(tmpdir, "video"), url],
-            capture_output=True, text=True, timeout=60,
+        proc = await asyncio.create_subprocess_exec(
+            yt_dlp_path, "--write-auto-sub", "--sub-lang", "en", "--skip-download",
+            "--sub-format", "vtt", "-o", os.path.join(tmpdir, "video"), url,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise ValueError(f"yt-dlp timed out for {url}")
+        stderr_text = stderr.decode(errors="replace")
         vtt_files = [f for f in os.listdir(tmpdir) if f.endswith(".vtt")]
         if not vtt_files:
-            raise ValueError(f"No transcript found for {url}. yt-dlp output: {result.stderr[:300]}")
+            raise ValueError(f"No transcript found for {url}. yt-dlp output: {stderr_text[:300]}")
 
         with open(os.path.join(tmpdir, vtt_files[0])) as f:
             vtt = f.read()
@@ -338,6 +345,11 @@ async def batch_classification_loop():
             clean = raw.strip().replace("```json", "").replace("```", "").strip()
             classifications = json.loads(clean)
 
+            if len(classifications) != len(pending):
+                print(f"[batch] MISMATCH: sent {len(pending)} items, got {len(classifications)} classifications — marking batch failed for retry")
+                for item_id in ids:
+                    supabase.table("items").update({"classification_status": "failed"}).eq("id", item_id).execute()
+                continue
             for item, cls in zip(pending, classifications):
                 supabase.table("items").update({
                     "category": cls.get("category", "thoughts"),
@@ -362,6 +374,8 @@ whisper_model = None
 
 
 async def _load_whisper():
+    import torch
+    torch.backends.mkldnn.enabled = False
     global whisper_model, _model_ready
     loop = asyncio.get_event_loop()
     whisper_model = await loop.run_in_executor(None, lambda: whisper.load_model("tiny"))
@@ -673,30 +687,12 @@ async def journal(data: JournalInput):
 
 @app.get("/finance", dependencies=[Depends(verify_api_key)])
 async def get_finance():
-    # Fetch category+subcategory matches
-    r1 = supabase.table("items").select("*")\
-        .eq("category", "life").eq("subcategory", "finance")\
-        .eq("status", "active").order("created_at", desc=True).limit(200).execute()
-
-    # Fetch tag matches
-    finance_tags = ["finance", "transaction", "debit", "credit"]
-    tag_results = []
-    for tag in finance_tags:
-        r = supabase.table("items").select("*")\
-            .eq("status", "active").contains("ai_tags", [tag])\
-            .order("created_at", desc=True).limit(200).execute()
-        tag_results.extend(r.data or [])
-
-    # Merge and deduplicate by id
-    seen = set()
-    items = []
-    for item in (r1.data or []) + tag_results:
-        if item["id"] not in seen:
-            seen.add(item["id"])
-            items.append(item)
-
-    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    items = items[:200]
+    # Single query: category+subcategory match OR any finance-related tag
+    r = supabase.table("items").select("*")\
+        .eq("status", "active")\
+        .or_('and(category.eq.life,subcategory.eq.finance),ai_tags.cs.["finance"],ai_tags.cs.["transaction"],ai_tags.cs.["debit"],ai_tags.cs.["credit"]')\
+        .order("created_at", desc=True).limit(200).execute()
+    items = r.data or []
 
     # Group by month
     monthly = {}
