@@ -75,6 +75,7 @@ class CaptureInput(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
     metadata: Optional[dict] = {}
+    category: Optional[str] = None
 
 
 async def call_1minai(prompt: str, model: str = ONEMIN_MODEL) -> str:
@@ -280,6 +281,7 @@ async def classify_single(item_id: str):
     try:
         result = supabase.table("items").select("*").eq("id", item_id).single().execute()
         item = result.data
+        user_category = item.get("category")
         supabase.table("items").update({"classification_status": "processing"}).eq("id", item_id).execute()
 
         raw_content = item["raw_content"] or ""
@@ -290,7 +292,7 @@ async def classify_single(item_id: str):
             if author:
                 tags.append(author.lower().replace(" ", "-"))
             supabase.table("items").update({
-                "category": "learning",
+                "category": user_category or "learning",
                 "subcategory": "quotes",
                 "ai_tags": tags,
                 "ai_summary": raw_content,
@@ -304,7 +306,7 @@ async def classify_single(item_id: str):
             cls = json.loads(clean)
 
             supabase.table("items").update({
-                "category": cls.get("category", "thoughts"),
+                "category": user_category or cls.get("category", "thoughts"),
                 "subcategory": cls.get("subcategory"),
                 "ai_tags": cls.get("tags", []),
                 "ai_summary": cls.get("summary", ""),
@@ -507,6 +509,7 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
         "location_lat": data.lat,
         "location_lng": data.lng,
         "metadata": metadata,
+        "category": data.category,
     }).execute()
 
     item_id = result.data[0]["id"]
