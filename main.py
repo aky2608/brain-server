@@ -501,7 +501,7 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
                 content = url
                 metadata.update({"url": url, "fetch_error": str(e)})
 
-    result = supabase.table("items").insert({
+    insert_payload = {
         "raw_content": content,
         "source": data.source,
         "capture_type": capture_type,
@@ -509,8 +509,10 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
         "location_lat": data.lat,
         "location_lng": data.lng,
         "metadata": metadata,
-        "category": data.category,
-    }).execute()
+    }
+    if data.category:
+        insert_payload["category"] = data.category
+    result = supabase.table("items").insert(insert_payload).execute()
 
     item_id = result.data[0]["id"]
 
