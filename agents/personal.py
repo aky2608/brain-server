@@ -17,9 +17,10 @@ logger = logging.getLogger("brain")
 # capture_shortcuts.agent column must match keys defined here.
 # Add new specialists here when they're wired into graph.py.
 DISPATCH_MAP: dict[str, str] = {
-    "capture_agent": "capture_agent",  # default classify path (Weekend 7+)
-    "echo": "echo_agent",              # Weekend 6 proof — keep forever
+    "capture_agent": "capture_agent",        # default classify path (Weekend 7+)
+    "echo": "echo_agent",                    # Weekend 6 proof — keep forever
     "why": "why_agent",
+    "scheduling_agent": "scheduling_agent",  # cron 6:30am + reactive on task_status change
 }
 
 
@@ -69,6 +70,15 @@ def personal_agent_node(state: GraphState) -> dict:
         Every routing decision is written to agent_decisions before returning.
     """
     if state.get("specialist_result") is not None:
+        # Relay any decisions a specialist surfaced — sole-writer invariant: only
+        # personal_agent writes to agent_decisions; specialists return decisions for us to log.
+        for d in (state["specialist_result"] or {}).get("decisions", []):
+            _log_decision(
+                agent_name="scheduling_agent",
+                action_taken=d.get("action_taken", ""),
+                reason=d.get("reason", ""),
+                item_id=d.get("item_id"),
+            )
         return {"routed_to": None}
 
     raw = (state.get("raw_input") or "").strip()

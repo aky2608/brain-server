@@ -614,14 +614,17 @@ async def get_item(item_id: str):
 
 
 @app.patch("/items/{item_id}", dependencies=[Depends(verify_api_key)])
-async def update_item(item_id: str, updates: dict):
+async def update_item(item_id: str, updates: dict, bg: BackgroundTasks):
     allowed = {"category", "subcategory", "ai_tags", "task_status",
                "task_deadline", "task_progress", "plan_bucket",
-               "plan_order", "status", "reviewed", "raw_content", "ai_summary"}
+               "plan_order", "plan_date", "rollover_note",
+               "status", "reviewed", "raw_content", "ai_summary"}
     filtered = {k: v for k, v in updates.items() if k in allowed}
     if not filtered:
         raise HTTPException(400, "No valid fields to update")
     result = supabase.table("items").update(filtered).eq("id", item_id).execute()
+    if "task_status" in filtered:
+        bg.add_task(_invoke_graph_bg, item_id, "/plan", "system")
     return result.data[0]
 
 
