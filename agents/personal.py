@@ -11,13 +11,14 @@ from shortcuts import lookup_shortcut, parse_slash
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("brain")
 
 # Static graph routing table: routing_key → LangGraph node name.
 # capture_shortcuts.agent column must match keys defined here.
 # Add new specialists here when they're wired into graph.py.
 DISPATCH_MAP: dict[str, str] = {
-    "echo": "echo_agent",  # Weekend 6 proof — keep forever
+    "capture_agent": "capture_agent",  # default classify path (Weekend 7+)
+    "echo": "echo_agent",              # Weekend 6 proof — keep forever
     "why": "why_agent",
 }
 
@@ -114,19 +115,19 @@ def personal_agent_node(state: GraphState) -> dict:
             )
             return {"routed_to": category}
         _log_decision(
-            agent_name="echo_agent",
+            agent_name="capture_agent",
             action_taken=f"route_category_unhandled:{category}",
-            reason=f"category {category!r} has no specialist wired yet, defaulting to echo",
+            reason=f"category {category!r} has no specialist wired yet, classify via capture_agent",
         )
-        return {"routed_to": "echo"}
+        return {"routed_to": "capture_agent"}
 
-    # 4. Fallback
+    # 4. Fallback — capture_agent is the default classify path for all non-slash non-why input
     _log_decision(
-        agent_name="echo_agent",
+        agent_name="capture_agent",
         action_taken="route_fallback",
-        reason="no slash/why/category match; defaulting to echo",
+        reason="no slash/why/category match; routing to capture_agent for classify+embed",
     )
-    return {"routed_to": "echo"}
+    return {"routed_to": "capture_agent"}
 
 
 def route_from_personal(state: GraphState) -> str:

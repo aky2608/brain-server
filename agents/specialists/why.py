@@ -9,7 +9,7 @@ from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowMo
 
 load_dotenv()
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("brain")
 
 
 class WhyInput(NarrowModel):

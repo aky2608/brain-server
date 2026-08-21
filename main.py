@@ -573,6 +573,7 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
         bg.add_task(_invoke_graph_bg, item_id, content, data.source)
     elif is_active:
         bg.add_task(classify_single, item_id)
+        bg.add_task(_invoke_graph_bg, item_id, content, data.source)  # shadow: capture_agent runs alongside classify_single
 
     path = "shortcut" if shortcut else ("instant" if is_active else "queued")
     response = {"status": "captured", "id": item_id, "path": path, "capture_type": capture_type}

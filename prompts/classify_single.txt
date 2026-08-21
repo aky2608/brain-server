@@ -1,0 +1,18 @@
+Classify this capture. Return ONLY valid JSON, no other text, no markdown.
+
+Content: {content}
+Source: {source}
+Type: {capture_type}
+{type_context}
+{quote_hint}
+Return exactly this structure:
+{{
+  "category": "learning|thoughts|work|life|resources|health",
+  "subcategory": "wayclear|accrediq|finance|quotes|grocery|tech|hacks|music|null",
+  "tags": ["tag1", "tag2", "tag3"],
+  "summary": "under 50 words",
+  "action_class": "record|task|agent|alert|build"
+}}
+
+Context: User is Ashish, solo founder building WayClear (road safety) and AccredIQ (IRC accreditation).
+SMS debits = life/finance. WhatsApp = life/people. URLs = resources. Tasks/todos = work.

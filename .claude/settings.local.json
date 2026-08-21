@@ -33,7 +33,8 @@
       "Bash(venv/bin/pip install *)",
       "Bash(venv/bin/pip show *)",
       "Bash(venv/bin/python *)",
-      "Bash(pip list *)"
+      "Bash(pip list *)",
+      "Bash(python *)"
     ]
   }
 }
