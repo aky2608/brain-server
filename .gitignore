@@ -4,3 +4,7 @@ __pycache__/
 .env
 dummy.m4a
 *.m4a
+*.bak.*
+.env*
+*.bak.*
+.env*
