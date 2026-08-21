@@ -18,6 +18,7 @@ from pydantic import ValidationError
 from agents.base import GraphState
 from agents.personal import personal_agent_node, route_from_personal
 from agents.specialists.echo import EchoInput, echo_agent_node
+from agents.specialists.why import why_agent_node
 
 load_dotenv()
 DB_URL = os.environ["BRAIN_DB_URL"]
@@ -28,10 +29,12 @@ def build_graph(checkpointer: PostgresSaver):
 
     builder.add_node("personal_agent", personal_agent_node)
     builder.add_node("echo_agent", echo_agent_node)
+    builder.add_node("why_agent", why_agent_node)
 
     builder.set_entry_point("personal_agent")
     builder.add_conditional_edges("personal_agent", route_from_personal)
     builder.add_edge("echo_agent", "personal_agent")
+    builder.add_edge("why_agent", "personal_agent")
 
     return builder.compile(checkpointer=checkpointer)
 

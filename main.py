@@ -23,6 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import Client, create_client
 
+from shortcuts import lookup_shortcut, parse_slash
+
 load_dotenv()
 
 
@@ -277,6 +279,41 @@ async def fetch_youtube_transcript(url: str) -> str:
     return " ".join(lines)[:8000]
 
 
+async def _invoke_graph_bg(item_id: str, content: str, source: str) -> None:
+    """
+    Fire the LangGraph personal-agent pipeline for a shortcut-routed item.
+    classify_single is NOT called for these items — category is already set from capture_shortcuts.
+    On any failure: log full traceback at ERROR with item_id, then swallow so the stored item is unaffected.
+    """
+    import traceback
+    from graph import build_graph
+    from langgraph.checkpoint.postgres import PostgresSaver
+
+    db_url = os.environ.get("BRAIN_DB_URL", "")
+    if not db_url:
+        logger.error("_invoke_graph_bg skipped: BRAIN_DB_URL not set", extra={"ctx": {"item_id": item_id}})
+        return
+    try:
+        with PostgresSaver.from_conn_string(db_url) as checkpointer:
+            graph = build_graph(checkpointer)
+            graph.invoke(
+                {
+                    "raw_input": content,
+                    "source": source,
+                    "capture_uuid": item_id,
+                    "routed_to": None,
+                    "specialist_result": None,
+                },
+                config={"configurable": {"thread_id": item_id}},
+            )
+        logger.info("graph invoked", extra={"ctx": {"item_id": item_id, "source": source}})
+    except Exception:
+        logger.error(
+            "graph invocation failed\n" + traceback.format_exc(),
+            extra={"ctx": {"item_id": item_id, "source": source}},
+        )
+
+
 async def classify_single(item_id: str):
     try:
         result = supabase.table("items").select("*").eq("id", item_id).single().execute()
@@ -473,6 +510,12 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
     capture_type = data.capture_type
     metadata = dict(data.metadata or {})
 
+    # Deterministic slash-command check — BEFORE any LLM path. Zero cost.
+    # /alias [rest] → lookup alias in capture_shortcuts → if found, skip classification.
+    # Not found → fall through silently; normal classify path takes over.
+    slash_alias = parse_slash(content)
+    shortcut = lookup_shortcut(slash_alias) if slash_alias else None
+
     # Auto-detect URL captures
     stripped = content.strip()
     if stripped.lower().startswith(("http://", "https://")):
@@ -501,25 +544,41 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
                 content = url
                 metadata.update({"url": url, "fetch_error": str(e)})
 
+    # Shortcut hit → skip LLM classification entirely
+    if shortcut:
+        classification_status = "shortcut"
+    elif is_active:
+        classification_status = "instant"
+    else:
+        classification_status = "queued"
+
     insert_payload = {
         "raw_content": content,
         "source": data.source,
         "capture_type": capture_type,
-        "classification_status": "instant" if is_active else "queued",
+        "classification_status": classification_status,
         "location_lat": data.lat,
         "location_lng": data.lng,
         "metadata": metadata,
     }
     if data.category:
         insert_payload["category"] = data.category
+    elif shortcut and shortcut.get("category"):
+        insert_payload["category"] = shortcut["category"]
     result = supabase.table("items").insert(insert_payload).execute()
 
     item_id = result.data[0]["id"]
 
-    if is_active:
+    if shortcut:
+        bg.add_task(_invoke_graph_bg, item_id, content, data.source)
+    elif is_active:
         bg.add_task(classify_single, item_id)
 
-    return {"status": "captured", "id": item_id, "path": "instant" if is_active else "queued", "capture_type": capture_type}
+    path = "shortcut" if shortcut else ("instant" if is_active else "queued")
+    response = {"status": "captured", "id": item_id, "path": path, "capture_type": capture_type}
+    if shortcut:
+        response["alias"] = slash_alias
+    return response
 
 
 @app.get("/items", dependencies=[Depends(verify_api_key)])
