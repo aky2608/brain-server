@@ -242,7 +242,7 @@ def _write_classification(item_id: str, cls: dict, conn: psycopg.Connection) -> 
     tags = cls.get("tags", [])
     conn.execute(
         """UPDATE items SET
-               category              = COALESCE(category, %s),
+               category              = %s,
                subcategory           = %s,
                ai_tags               = %s,
                ai_summary            = %s,
