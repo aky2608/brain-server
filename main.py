@@ -3,6 +3,7 @@ import io
 import json
 import logging
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -68,6 +69,11 @@ supabase: Client = create_client(
 ACTIVE_SOURCES = {"app_voice", "app_text", "app_share", "app_photo", "web_upload", "telegram"}
 ONEMIN_MODEL = "claude-haiku-4-5-20251001"
 FALLBACK_MODEL = "gpt-4o-mini"
+
+# Fail loud at startup if the prompt file is missing — better than silent runtime failures.
+_CLASSIFY_TEMPLATE: str = (
+    pathlib.Path(__file__).parent / "prompts" / "classify_single.txt"
+).read_text()
 
 
 class CaptureInput(BaseModel):
@@ -141,25 +147,13 @@ def build_single_prompt(content: str, source: str, capture_type: str = "text") -
     if _detect_quote(content)[0]:
         quote_hint = "If this looks like a quote or saying, set category=learning, subcategory=quotes, and include the author in tags if identifiable."
 
-    return f"""Classify this capture. Return ONLY valid JSON, no other text, no markdown.
-
-Content: {content[:1000]}
-Source: {source}
-Type: {capture_type}
-{type_context}
-{quote_hint}
-
-Return exactly this structure:
-{{
-  "category": "learning|thoughts|work|life|resources|health",
-  "subcategory": "wayclear|accrediq|finance|quotes|grocery|tech|hacks|music|null",
-  "tags": ["tag1", "tag2", "tag3"],
-  "summary": "under 50 words",
-  "action_class": "record|task|agent|alert|build"
-}}
-
-Context: User is Ashish, solo founder building WayClear (road safety) and AccredIQ (IRC accreditation).
-SMS debits = life/finance. WhatsApp = life/people. URLs = resources. Tasks/todos = work."""
+    return _CLASSIFY_TEMPLATE.format(
+        content=content[:1000],
+        source=source,
+        capture_type=capture_type,
+        type_context=type_context,
+        quote_hint=quote_hint,
+    )
 
 
 def build_batch_prompt(items: list) -> str:
