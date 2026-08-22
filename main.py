@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import pathlib
+import psycopg
 import re
 import shutil
 import subprocess
@@ -831,3 +832,259 @@ async def upload_audio(
 async def delete_item(item_id: str):
     supabase.table("items").update({"status": "deleted"}).eq("id", item_id).execute()
     return {"status": "deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Backlinks + graph endpoints (raw psycopg — thought_links requires joins
+# the Supabase client can't express)
+# ---------------------------------------------------------------------------
+
+def _db_conn() -> psycopg.Connection:
+    url = os.environ.get("BRAIN_DB_URL", "")
+    if not url:
+        raise HTTPException(500, "BRAIN_DB_URL not set")
+    return psycopg.connect(url)
+
+
+def _summary_snippet(text: str | None, max_len: int = 100) -> str | None:
+    if not text:
+        return None
+    return text[:max_len] + ("…" if len(text) > max_len else "")
+
+
+def _mention_snippet(raw: str, title: str, window: int = 120) -> str:
+    idx = raw.lower().find(title.lower())
+    if idx == -1:
+        return raw[:window]
+    start = max(0, idx - 40)
+    end = min(len(raw), idx + len(title) + 80)
+    snippet = raw[start:end]
+    if start > 0:
+        snippet = "…" + snippet
+    if end < len(raw):
+        snippet = snippet + "…"
+    return snippet
+
+
+@app.get("/items/{item_id}/backlinks", dependencies=[Depends(verify_api_key)])
+async def get_backlinks(item_id: str):
+    with _db_conn() as conn:
+        rows = conn.execute(
+            """SELECT i.id, i.title, i.category, i.ai_summary,
+                      tl.link_type, tl.wikilink_text, tl.similarity_score
+                 FROM thought_links tl
+                 JOIN items i ON i.id = tl.source_item_id
+                WHERE tl.target_item_id = %s
+                  AND i.status = 'active'
+                ORDER BY tl.created_at DESC""",
+            (item_id,),
+        ).fetchall()
+
+    backlinks = [
+        {
+            "source_id":        str(r[0]),
+            "title":            r[1],
+            "category":         r[2],
+            "summary":          _summary_snippet(r[3]),
+            "link_type":        r[4],
+            "wikilink_text":    r[5],
+            "similarity_score": r[6],
+        }
+        for r in rows
+    ]
+    return {"item_id": item_id, "backlinks": backlinks, "count": len(backlinks)}
+
+
+@app.get("/items/{item_id}/unlinked-mentions", dependencies=[Depends(verify_api_key)])
+async def get_unlinked_mentions(item_id: str):
+    with _db_conn() as conn:
+        item = conn.execute(
+            "SELECT title FROM items WHERE id = %s AND status = 'active'",
+            (item_id,),
+        ).fetchone()
+
+    if not item:
+        raise HTTPException(404, "Item not found")
+    title = item[0]
+    if not title:
+        raise HTTPException(404, "Item has no title — unlinked-mentions only applies to titled items")
+
+    with _db_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, title, category, ai_summary, raw_content
+                 FROM items
+                WHERE raw_content ILIKE '%%' || %s || '%%'
+                  AND id != %s
+                  AND status = 'active'
+                  AND id NOT IN (
+                      SELECT source_item_id FROM thought_links
+                       WHERE target_item_id = %s
+                         AND link_type = 'wikilink'
+                  )
+                ORDER BY created_at DESC""",
+            (title, item_id, item_id),
+        ).fetchall()
+
+    mentions = [
+        {
+            "id":       str(r[0]),
+            "title":    r[1],
+            "category": r[2],
+            "summary":  _summary_snippet(r[3]),
+            "snippet":  _mention_snippet(r[4] or "", title),
+        }
+        for r in rows
+    ]
+    return {"item_id": item_id, "title": title, "mentions": mentions, "count": len(mentions)}
+
+
+@app.post("/items/{item_id}/link-mentions", dependencies=[Depends(verify_api_key)])
+async def link_mentions(item_id: str):
+    with _db_conn() as conn:
+        item = conn.execute(
+            "SELECT title FROM items WHERE id = %s AND status = 'active'",
+            (item_id,),
+        ).fetchone()
+
+        if not item:
+            raise HTTPException(404, "Item not found")
+        title = item[0]
+        if not title:
+            raise HTTPException(404, "Item has no title — link-mentions only applies to titled items")
+
+        rows = conn.execute(
+            """SELECT id FROM items
+                WHERE raw_content ILIKE '%%' || %s || '%%'
+                  AND id != %s
+                  AND status = 'active'
+                  AND id NOT IN (
+                      SELECT source_item_id FROM thought_links
+                       WHERE target_item_id = %s
+                         AND link_type = 'wikilink'
+                  )""",
+            (title, item_id, item_id),
+        ).fetchall()
+
+        linked = skipped = 0
+        for (source_id,) in rows:
+            result = conn.execute(
+                """INSERT INTO thought_links
+                       (source_item_id, target_item_id, link_type, wikilink_text)
+                   VALUES (%s, %s, 'wikilink', %s)
+                   ON CONFLICT (source_item_id, target_item_id, link_type) DO NOTHING""",
+                (str(source_id), item_id, title),
+            )
+            if result.rowcount == 1:
+                linked += 1
+            else:
+                skipped += 1
+        conn.commit()
+
+    return {"item_id": item_id, "title": title, "linked": linked, "skipped": skipped}
+
+
+@app.get("/graph", dependencies=[Depends(verify_api_key)])
+async def get_graph():
+    NODE_CAP = 500
+    with _db_conn() as conn:
+        node_rows = conn.execute(
+            """SELECT DISTINCT i.id, i.title, i.category, i.ai_summary
+                 FROM items i
+                WHERE i.status = 'active'
+                  AND i.id IN (
+                      SELECT source_item_id FROM thought_links
+                      UNION
+                      SELECT target_item_id FROM thought_links
+                  )
+                LIMIT %s""",
+            (NODE_CAP + 1,),
+        ).fetchall()
+
+        capped = len(node_rows) > NODE_CAP
+        node_rows = node_rows[:NODE_CAP]
+        node_ids = {r[0] for r in node_rows}
+
+        edge_rows = conn.execute(
+            """SELECT source_item_id, target_item_id, link_type
+                 FROM thought_links
+                WHERE source_item_id = ANY(%s)
+                  AND target_item_id = ANY(%s)""",
+            (list(node_ids), list(node_ids)),
+        ).fetchall()
+
+    nodes = [
+        {
+            "id":       str(r[0]),
+            "title":    r[1],
+            "category": r[2],
+            "summary":  _summary_snippet(r[3], max_len=80),
+        }
+        for r in node_rows
+    ]
+    edges = [
+        {"source": str(r[0]), "target": str(r[1]), "link_type": r[2]}
+        for r in edge_rows
+    ]
+    return {
+        "nodes":      nodes,
+        "edges":      edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "capped":     capped,
+    }
+
+
+@app.get("/items/{item_id}/graph", dependencies=[Depends(verify_api_key)])
+async def get_item_graph(item_id: str):
+    with _db_conn() as conn:
+        exists = conn.execute(
+            "SELECT 1 FROM items WHERE id = %s AND status = 'active'",
+            (item_id,),
+        ).fetchone()
+        if not exists:
+            raise HTTPException(404, "Item not found")
+
+        node_rows = conn.execute(
+            """SELECT DISTINCT i.id, i.title, i.category, i.ai_summary
+                 FROM items i
+                WHERE i.status = 'active'
+                  AND (
+                      i.id = %s
+                      OR i.id IN (
+                          SELECT target_item_id FROM thought_links WHERE source_item_id = %s
+                          UNION
+                          SELECT source_item_id FROM thought_links WHERE target_item_id = %s
+                      )
+                  )""",
+            (item_id, item_id, item_id),
+        ).fetchall()
+
+        node_ids = {r[0] for r in node_rows}
+        edge_rows = conn.execute(
+            """SELECT source_item_id, target_item_id, link_type
+                 FROM thought_links
+                WHERE source_item_id = ANY(%s)
+                  AND target_item_id = ANY(%s)""",
+            (list(node_ids), list(node_ids)),
+        ).fetchall()
+
+    nodes = [
+        {
+            "id":       str(r[0]),
+            "title":    r[1],
+            "category": r[2],
+            "summary":  _summary_snippet(r[3], max_len=80),
+        }
+        for r in node_rows
+    ]
+    edges = [
+        {"source": str(r[0]), "target": str(r[1]), "link_type": r[2]}
+        for r in edge_rows
+    ]
+    return {
+        "focal_id":   item_id,
+        "nodes":      nodes,
+        "edges":      edges,
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+    }
