@@ -358,6 +358,17 @@ async def classify_single(item_id: str):
         supabase.table("items").update({"classification_status": "failed"}).eq("id", item_id).execute()
 
 
+async def watch_eval_loop():
+    """Evaluate watch rules every hour. Uses the same graph path as /watch slash command."""
+    await asyncio.sleep(300)  # let startup settle before first run
+    while True:
+        try:
+            await _invoke_graph_bg("watch-cron", "/watch", "system")
+        except Exception as e:
+            logger.error("watch_eval_loop error", extra={"ctx": {"error": str(e)}})
+        await asyncio.sleep(3600)
+
+
 async def batch_classification_loop():
     await asyncio.sleep(30)
     while True:
@@ -424,9 +435,11 @@ async def _load_whisper():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     asyncio.create_task(_load_whisper())
-    task = asyncio.create_task(batch_classification_loop())
+    batch_task = asyncio.create_task(batch_classification_loop())
+    watch_task = asyncio.create_task(watch_eval_loop())
     yield
-    task.cancel()
+    batch_task.cancel()
+    watch_task.cancel()
 
 
 app = FastAPI(title="Brain API", version="1.0", lifespan=lifespan)

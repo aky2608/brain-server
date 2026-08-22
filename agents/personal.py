@@ -21,6 +21,7 @@ DISPATCH_MAP: dict[str, str] = {
     "echo": "echo_agent",                    # Weekend 6 proof — keep forever
     "why": "why_agent",
     "scheduling_agent": "scheduling_agent",  # cron 6:30am + reactive on task_status change
+    "watch_agent": "watch_agent",            # zero-LLM watch rule evaluator (Phase 2.7)
 }
 
 
@@ -74,9 +75,10 @@ def personal_agent_node(state: GraphState) -> dict:
         # personal_agent writes to agent_decisions; specialists return decisions for us to log.
         for d in (state["specialist_result"] or {}).get("decisions", []):
             _log_decision(
-                agent_name="scheduling_agent",
+                agent_name=d.get("agent_name", "scheduling_agent"),
                 action_taken=d.get("action_taken", ""),
                 reason=d.get("reason", ""),
+                interrupt_tier=d.get("interrupt_tier", "log_only"),
                 item_id=d.get("item_id"),
             )
         return {"routed_to": None}
