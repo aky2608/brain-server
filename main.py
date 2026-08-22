@@ -84,6 +84,7 @@ class CaptureInput(BaseModel):
     lng: Optional[float] = None
     metadata: Optional[dict] = {}
     category: Optional[str] = None
+    title: Optional[str] = None
 
 
 async def call_1minai(prompt: str, model: str = ONEMIN_MODEL) -> str:
@@ -572,15 +573,14 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
         insert_payload["category"] = data.category
     elif shortcut and shortcut.get("category"):
         insert_payload["category"] = shortcut["category"]
+    if data.title:
+        insert_payload["title"] = data.title
     result = supabase.table("items").insert(insert_payload).execute()
 
     item_id = result.data[0]["id"]
 
-    if shortcut:
+    if shortcut or is_active:
         bg.add_task(_invoke_graph_bg, item_id, content, data.source)
-    elif is_active:
-        bg.add_task(classify_single, item_id)
-        bg.add_task(_invoke_graph_bg, item_id, content, data.source)  # shadow: capture_agent runs alongside classify_single
 
     path = "shortcut" if shortcut else ("instant" if is_active else "queued")
     response = {"status": "captured", "id": item_id, "path": path, "capture_type": capture_type}
@@ -727,7 +727,7 @@ async def upload_pdf(bg: BackgroundTasks, file: UploadFile = File(...), source: 
 
     item_id = result.data[0]["id"]
     if is_active:
-        bg.add_task(classify_single, item_id)
+        bg.add_task(_invoke_graph_bg, item_id, text[:10000], source)
 
     return {"status": "captured", "id": item_id, "filename": file.filename, "pages": len(reader.pages), "path": "instant" if is_active else "queued"}
 
@@ -822,7 +822,7 @@ async def upload_audio(
 
     item_id = result.data[0]["id"]
     if is_active:
-        bg.add_task(classify_single, item_id)
+        bg.add_task(_invoke_graph_bg, item_id, transcript, source)
 
     return {"status": "captured", "id": item_id, "transcript": transcript}
 
