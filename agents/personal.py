@@ -22,6 +22,7 @@ DISPATCH_MAP: dict[str, str] = {
     "why": "why_agent",
     "scheduling_agent": "scheduling_agent",  # cron 6:30am + reactive on task_status change
     "watch_agent": "watch_agent",            # zero-LLM watch rule evaluator (Phase 2.7)
+    "notebook_agent": "notebook_agent",      # /gate → GATE subject notebook routing
 }
 
 

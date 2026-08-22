@@ -835,6 +835,69 @@ async def delete_item(item_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Notebooks endpoints
+# ---------------------------------------------------------------------------
+
+class NotebookCreateInput(BaseModel):
+    name: str
+    notebook_type: str = "gate_subject"
+
+
+_VALID_NOTEBOOK_TYPES = {"gate_subject", "general", "project"}
+
+
+@app.post("/notebooks", dependencies=[Depends(verify_api_key)], status_code=201)
+async def create_notebook(data: NotebookCreateInput):
+    if data.notebook_type not in _VALID_NOTEBOOK_TYPES:
+        raise HTTPException(400, f"notebook_type must be one of {sorted(_VALID_NOTEBOOK_TYPES)}")
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(400, "name must not be blank")
+    with _db_conn() as conn:
+        row = conn.execute(
+            """INSERT INTO notebooks (name, notebook_type)
+               VALUES (%s, %s)
+               ON CONFLICT ON CONSTRAINT uq_notebooks_name_type
+               DO UPDATE SET archived_at = NULL
+               RETURNING id, name, notebook_type, created_at, archived_at""",
+            (name, data.notebook_type),
+        ).fetchone()
+        conn.commit()
+    return {
+        "id": row[0], "name": row[1], "notebook_type": row[2],
+        "created_at": row[3].isoformat(), "archived_at": row[4],
+    }
+
+
+@app.get("/notebooks", dependencies=[Depends(verify_api_key)])
+async def list_notebooks(
+    notebook_type: Optional[str] = None,
+    include_archived: bool = False,
+):
+    with _db_conn() as conn:
+        wheres = [] if include_archived else ["archived_at IS NULL"]
+        params: list = []
+        if notebook_type:
+            wheres.append("notebook_type = %s")
+            params.append(notebook_type)
+        where_clause = ("WHERE " + " AND ".join(wheres)) if wheres else ""
+        rows = conn.execute(
+            f"SELECT id, name, notebook_type, created_at, archived_at "
+            f"FROM notebooks {where_clause} ORDER BY notebook_type, name",
+            params,
+        ).fetchall()
+    return {
+        "notebooks": [
+            {
+                "id": r[0], "name": r[1], "notebook_type": r[2],
+                "created_at": r[3].isoformat(), "archived_at": r[4],
+            }
+            for r in rows
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
 # Backlinks + graph endpoints (raw psycopg — thought_links requires joins
 # the Supabase client can't express)
 # ---------------------------------------------------------------------------
