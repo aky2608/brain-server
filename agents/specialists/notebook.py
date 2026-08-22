@@ -131,12 +131,14 @@ class NotebookAgent(BaseAgent):
                     )
 
                 if item_id:
+                    clean_content = " ".join(tokens[1:])
                     conn.execute(
                         """UPDATE items
                               SET notebook_id = %s,
-                                  subcategory = 'gate'
+                                  subcategory = 'gate',
+                                  raw_content = %s
                             WHERE id = %s""",
-                        (notebook_id, item_id),
+                        (notebook_id, clean_content, item_id),
                     )
                     conn.commit()
 
