@@ -18,7 +18,7 @@ import httpx
 from starlette.requests import Request
 import whisper
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Security, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Security, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
@@ -70,6 +70,15 @@ supabase: Client = create_client(
 ACTIVE_SOURCES = {"app_voice", "app_text", "app_share", "app_photo", "web_upload", "telegram"}
 ONEMIN_MODEL = "claude-haiku-4-5-20251001"
 FALLBACK_MODEL = "gpt-4o-mini"
+
+_WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
+
+
+def _db_url() -> str:
+    url = os.environ.get("BRAIN_DB_URL", "")
+    if not url:
+        raise RuntimeError("BRAIN_DB_URL not set")
+    return url
 
 # Fail loud at startup if the prompt file is missing — better than silent runtime failures.
 _CLASSIFY_TEMPLATE: str = (
@@ -279,18 +288,14 @@ async def _invoke_graph_bg(item_id: str, content: str, source: str) -> None:
     """
     Fire the LangGraph personal-agent pipeline for a shortcut-routed item.
     classify_single is NOT called for these items — category is already set from capture_shortcuts.
-    On any failure: log full traceback at ERROR with item_id, then swallow so the stored item is unaffected.
+    On failure: logs full traceback at ERROR then re-raises so the worker can apply retry logic.
     """
     import traceback
     from graph import build_graph
     from langgraph.checkpoint.postgres import PostgresSaver
 
-    db_url = os.environ.get("BRAIN_DB_URL", "")
-    if not db_url:
-        logger.error("_invoke_graph_bg skipped: BRAIN_DB_URL not set", extra={"ctx": {"item_id": item_id}})
-        return
     try:
-        with PostgresSaver.from_conn_string(db_url) as checkpointer:
+        with PostgresSaver.from_conn_string(_db_url()) as checkpointer:
             graph = build_graph(checkpointer)
             graph.invoke(
                 {
@@ -308,6 +313,7 @@ async def _invoke_graph_bg(item_id: str, content: str, source: str) -> None:
             "graph invocation failed\n" + traceback.format_exc(),
             extra={"ctx": {"item_id": item_id, "source": source}},
         )
+        raise
 
 
 async def classify_single(item_id: str):
@@ -415,6 +421,179 @@ async def batch_classification_loop():
                     supabase.table("items").update({"classification_status": "queued"}).eq("id", item_id).execute()
 
 
+# ---------------------------------------------------------------------------
+# Job queue worker
+# ---------------------------------------------------------------------------
+
+def _enqueue_graph_invoke(item_id: str, content: str, source: str) -> None:
+    with psycopg.connect(_db_url()) as conn:
+        conn.execute(
+            "INSERT INTO job_queue (job_type, payload) VALUES ('graph_invoke', %s)",
+            (json.dumps({"item_id": item_id, "content": content, "source": source}),),
+        )
+        conn.commit()
+
+
+def _recover_stale_locks() -> int:
+    with psycopg.connect(_db_url()) as conn:
+        cur = conn.execute(
+            """UPDATE job_queue
+               SET status='queued', locked_by=NULL, locked_at=NULL
+               WHERE status='running'
+                 AND locked_at < now() - INTERVAL '10 minutes'"""
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def _claim_next_job() -> dict | None:
+    with psycopg.connect(_db_url()) as conn:
+        row = conn.execute(
+            """UPDATE job_queue
+               SET status='running', locked_by=%s, locked_at=now(),
+                   attempts=attempts+1, started_at=now()
+               WHERE id = (
+                   SELECT id FROM job_queue
+                   WHERE status='queued' AND scheduled_at <= now()
+                   ORDER BY priority, scheduled_at
+                   LIMIT 1
+                   FOR UPDATE SKIP LOCKED
+               )
+               RETURNING id, job_type, payload, attempts, max_attempts""",
+            (_WORKER_ID,),
+        ).fetchone()
+        conn.commit()
+    if row is None:
+        return None
+    return {"id": str(row[0]), "job_type": row[1], "payload": row[2],
+            "attempts": row[3], "max_attempts": row[4]}
+
+
+def _mark_job_done(job_id: str) -> None:
+    with psycopg.connect(_db_url()) as conn:
+        conn.execute(
+            "UPDATE job_queue SET status='done', finished_at=now() WHERE id=%s",
+            (job_id,),
+        )
+        conn.commit()
+
+
+def _mark_job_retry_or_dead(job_id: str, attempts: int, max_attempts: int, error: str) -> None:
+    status = "dead" if attempts >= max_attempts else "queued"
+    with psycopg.connect(_db_url()) as conn:
+        conn.execute(
+            """UPDATE job_queue
+               SET status=%s, locked_by=NULL, locked_at=NULL,
+                   finished_at=CASE WHEN %s='dead' THEN now() END,
+                   error=%s
+               WHERE id=%s""",
+            (status, status, error[:2000], job_id),
+        )
+        conn.commit()
+
+
+async def job_queue_worker() -> None:
+    import traceback
+    recovered = _recover_stale_locks()
+    if recovered:
+        logger.info("stale lock recovery", extra={"ctx": {"recovered": recovered}})
+
+    while True:
+        try:
+            job = _claim_next_job()
+            if job is None:
+                await asyncio.sleep(2)
+                continue
+
+            logger.info("job claimed", extra={"ctx": {"job_id": job["id"], "job_type": job["job_type"]}})
+            try:
+                if job["job_type"] == "graph_invoke":
+                    p = job["payload"]
+                    await _invoke_graph_bg(p["item_id"], p["content"], p["source"])
+                else:
+                    raise ValueError(f"unknown job_type: {job['job_type']!r}")
+                _mark_job_done(job["id"])
+                logger.info("job done", extra={"ctx": {"job_id": job["id"]}})
+            except Exception:
+                _mark_job_retry_or_dead(job["id"], job["attempts"], job["max_attempts"],
+                                        traceback.format_exc())
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("worker loop error", extra={"ctx": {"error": str(e)}})
+            await asyncio.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# Outbox delivery loop
+# ---------------------------------------------------------------------------
+
+def _poll_outbox() -> list[dict]:
+    with psycopg.connect(_db_url()) as conn:
+        rows = conn.execute(
+            """SELECT id, channel, recipient, message, attempts
+               FROM outbox WHERE status='pending'
+               ORDER BY created_at LIMIT 10"""
+        ).fetchall()
+    return [{"id": str(r[0]), "channel": r[1], "recipient": r[2],
+             "message": r[3], "attempts": r[4]} for r in rows]
+
+
+def _mark_outbox_sent(outbox_id: str) -> None:
+    with psycopg.connect(_db_url()) as conn:
+        conn.execute(
+            "UPDATE outbox SET status='sent', delivered_at=now() WHERE id=%s",
+            (outbox_id,),
+        )
+        conn.commit()
+
+
+def _mark_outbox_attempt(outbox_id: str, error: str) -> None:
+    with psycopg.connect(_db_url()) as conn:
+        conn.execute(
+            """UPDATE outbox
+               SET attempts=attempts+1, error=%s,
+                   status=CASE WHEN attempts+1 >= 5 THEN 'failed' ELSE status END
+               WHERE id=%s""",
+            (error[:500], outbox_id),
+        )
+        conn.commit()
+
+
+async def outbox_delivery_loop() -> None:
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    tg_base = f"https://api.telegram.org/bot{tg_token}"
+
+    while True:
+        try:
+            rows = _poll_outbox()
+            for row in rows:
+                try:
+                    if row["channel"] == "telegram":
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            r = await client.post(
+                                f"{tg_base}/sendMessage",
+                                json={"chat_id": int(row["recipient"]),
+                                      "text": row["message"],
+                                      "parse_mode": "Markdown"},
+                            )
+                            r.raise_for_status()
+                        _mark_outbox_sent(row["id"])
+                        logger.info("outbox sent", extra={"ctx": {"outbox_id": row["id"],
+                                                                   "channel": row["channel"]}})
+                    else:
+                        raise ValueError(f"unknown channel: {row['channel']!r}")
+                except Exception as e:
+                    logger.error("outbox delivery failed",
+                                 extra={"ctx": {"outbox_id": row["id"], "error": str(e)}})
+                    _mark_outbox_attempt(row["id"], str(e))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("outbox loop error", extra={"ctx": {"error": str(e)}})
+        await asyncio.sleep(5)
+
+
 _model_ready: bool = False
 whisper_model = None
 
@@ -433,9 +612,14 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(_load_whisper())
     batch_task = asyncio.create_task(batch_classification_loop())
     watch_task = asyncio.create_task(watch_eval_loop())
+    worker_task = asyncio.create_task(job_queue_worker())
+    outbox_task = asyncio.create_task(outbox_delivery_loop())
     yield
     batch_task.cancel()
     watch_task.cancel()
+    worker_task.cancel()
+    outbox_task.cancel()
+    await asyncio.gather(worker_task, outbox_task, return_exceptions=True)
 
 
 app = FastAPI(title="Brain API", version="1.0", lifespan=lifespan)
@@ -513,7 +697,7 @@ async def health():
 
 
 @app.post("/capture", dependencies=[Depends(verify_api_key)])
-async def capture(data: CaptureInput, bg: BackgroundTasks):
+async def capture(data: CaptureInput):
     is_active = data.source in ACTIVE_SOURCES
     content = data.content
     capture_type = data.capture_type
@@ -581,7 +765,7 @@ async def capture(data: CaptureInput, bg: BackgroundTasks):
     item_id = result.data[0]["id"]
 
     if shortcut or is_active:
-        bg.add_task(_invoke_graph_bg, item_id, content, data.source)
+        _enqueue_graph_invoke(item_id, content, data.source)
 
     path = "shortcut" if shortcut else ("instant" if is_active else "queued")
     response = {"status": "captured", "id": item_id, "path": path, "capture_type": capture_type}
@@ -622,7 +806,7 @@ async def get_item(item_id: str):
 
 
 @app.patch("/items/{item_id}", dependencies=[Depends(verify_api_key)])
-async def update_item(item_id: str, updates: dict, bg: BackgroundTasks):
+async def update_item(item_id: str, updates: dict):
     allowed = {"category", "subcategory", "ai_tags", "task_status",
                "task_deadline", "task_progress", "plan_bucket",
                "plan_order", "plan_date", "rollover_note",
@@ -632,7 +816,7 @@ async def update_item(item_id: str, updates: dict, bg: BackgroundTasks):
         raise HTTPException(400, "No valid fields to update")
     result = supabase.table("items").update(filtered).eq("id", item_id).execute()
     if "task_status" in filtered:
-        bg.add_task(_invoke_graph_bg, item_id, "/plan", "system")
+        _enqueue_graph_invoke(item_id, "/plan", "system")
     return result.data[0]
 
 
@@ -698,7 +882,7 @@ async def move_planner(item_id: str, body: MovePlannerInput):
     return result.data[0]
 
 @app.post("/upload", dependencies=[Depends(verify_api_key)])
-async def upload_pdf(bg: BackgroundTasks, file: UploadFile = File(...), source: str = "web_upload"):
+async def upload_pdf(file: UploadFile = File(...), source: str = "web_upload"):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported")
 
@@ -728,7 +912,7 @@ async def upload_pdf(bg: BackgroundTasks, file: UploadFile = File(...), source: 
 
     item_id = result.data[0]["id"]
     if is_active:
-        bg.add_task(_invoke_graph_bg, item_id, text[:10000], source)
+        _enqueue_graph_invoke(item_id, text[:10000], source)
 
     return {"status": "captured", "id": item_id, "filename": file.filename, "pages": len(reader.pages), "path": "instant" if is_active else "queued"}
 
@@ -793,7 +977,6 @@ async def upload_audio(
     file: UploadFile = File(...),
     source: str = Form("app_voice"),
     capture_type: str = Form("voice"),
-    bg: BackgroundTasks = BackgroundTasks()
 ):
     if not _model_ready:
         raise HTTPException(status_code=503, detail="whisper model loading")
@@ -823,7 +1006,7 @@ async def upload_audio(
 
     item_id = result.data[0]["id"]
     if is_active:
-        bg.add_task(_invoke_graph_bg, item_id, transcript, source)
+        _enqueue_graph_invoke(item_id, transcript, source)
 
     return {"status": "captured", "id": item_id, "transcript": transcript}
 
