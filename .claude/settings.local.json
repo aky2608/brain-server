@@ -40,7 +40,8 @@
       "Bash(xargs ls *)",
       "Bash(docker exec supabase-db *)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8100/health)",
-      "Bash(curl -s http://localhost:8100/health)"
+      "Bash(curl -s http://localhost:8100/health)",
+      "Bash(alembic upgrade *)"
     ]
   }
 }

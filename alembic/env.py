@@ -6,9 +6,9 @@ from sqlalchemy import create_engine, pool
 
 from alembic import context
 
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env.migrations"))
 
-DB_URL = os.environ["BRAIN_DB_URL"]
+DB_URL = os.environ["ALEMBIC_DB_URL"]
 
 config = context.config
 
