@@ -12,4 +12,4 @@ Scoring guide:
 Questions and answers:
 {pairs}
 
-Return only the JSON array, e.g.: [{"position": 1, "score": 7}, {"position": 2, "score": 4}]
+Return only the JSON array, e.g.: [{{"position": 1, "score": 7}}, {{"position": 2, "score": 4}}]
