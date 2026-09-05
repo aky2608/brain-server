@@ -157,28 +157,43 @@ def _eval_gate_missed(conn: psycopg.Connection, rule: dict) -> Optional[dict]:
     threshold_escalate = int(cond.get("threshold_escalate", 5))
     window_days = int(cond.get("window_days", 7))
 
-    # Check for completed GATE drills since last clear (or all-time if never cleared)
-    # status filter deliberately omitted: a drill completed then archived/deleted still
-    # counts as done — "a completed drill always clears its missed-counter", full stop.
+    # Combined clear-check: a verified drill_sessions row OR a revision_reviews row
+    # on a gate_subject notebook, either dated after last_cleared_at.
+    # notebook_type = 'gate_subject' covers all present and future GATE notebooks
+    # automatically — no name list to maintain.
     last_cleared = rule.get("last_cleared_at")
     if last_cleared:
-        completed = conn.execute(
-            """SELECT COUNT(*) FROM items
-                WHERE action_class = 'task'
-                  AND task_status = 'done'
-                  AND (subcategory = 'gate' OR ai_tags @> '["gate"]'::jsonb)
-                  AND updated_at > %s""",
-            (last_cleared,),
+        cleared = conn.execute(
+            """SELECT EXISTS (
+                   SELECT 1 FROM drill_sessions
+                   WHERE verified = true AND created_at > %s
+
+                   UNION ALL
+
+                   SELECT 1 FROM revision_reviews rr
+                   JOIN revision_questions rq ON rq.id = rr.question_id
+                   JOIN notebooks nb ON nb.id = rq.notebook_id
+                   WHERE rr.reviewed_at > %s AND nb.notebook_type = 'gate_subject'
+                   LIMIT 1
+               )""",
+            (last_cleared, last_cleared),
         ).fetchone()[0]
     else:
-        completed = conn.execute(
-            """SELECT COUNT(*) FROM items
-                WHERE action_class = 'task'
-                  AND task_status = 'done'
-                  AND (subcategory = 'gate' OR ai_tags @> '["gate"]'::jsonb)""",
+        cleared = conn.execute(
+            """SELECT EXISTS (
+                   SELECT 1 FROM drill_sessions WHERE verified = true
+
+                   UNION ALL
+
+                   SELECT 1 FROM revision_reviews rr
+                   JOIN revision_questions rq ON rq.id = rr.question_id
+                   JOIN notebooks nb ON nb.id = rq.notebook_id
+                   WHERE nb.notebook_type = 'gate_subject'
+                   LIMIT 1
+               )""",
         ).fetchone()[0]
 
-    if completed > 0:
+    if cleared:
         conn.execute(
             "UPDATE agent_watch_rules SET missed_count = 0, last_cleared_at = now() WHERE id = %s",
             (rule["id"],),
