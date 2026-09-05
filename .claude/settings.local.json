@@ -41,7 +41,15 @@
       "Bash(docker exec supabase-db *)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:8100/health)",
       "Bash(curl -s http://localhost:8100/health)",
-      "Bash(alembic upgrade *)"
+      "Bash(alembic upgrade *)",
+      "Bash(/opt/brain/venv/bin/python3 *)",
+      "Bash(git log *)",
+      "Bash(systemctl show *)",
+      "Bash(journalctl -u brain-api --since=\"2026-09-03\" --until=\"2026-09-05\" --grep=\"startup\\\\|started\\\\|BRAIN_DB_URL\\\\|fastapi_app\" --no-pager -n 30)",
+      "Bash(journalctl -u brain-api --since=\"2026-09-03 00:00:00\" --until=\"2026-09-05 19:00:00\" --no-pager -n 50)",
+      "Bash(journalctl -u brain-api --since=\"2026-09-03 00:00:00\" --until=\"2026-09-05 19:00:00\" --no-pager)",
+      "Bash(journalctl -u brain-api --since=\"2026-09-03\" --until=\"2026-09-05 19:00:00\" --no-pager -o short)",
+      "Bash(awk -F'brain-api\\\\[' '{print $2}')"
     ]
   }
 }

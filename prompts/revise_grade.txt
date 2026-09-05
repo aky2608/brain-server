@@ -1,0 +1,15 @@
+Grade a student's answer to a revision question. Return ONLY a single integer from 0 to 10, nothing else.
+
+Question: {question}
+
+Expected answer: {expected_answer}
+
+Student's answer: {user_answer}
+
+Scoring guide:
+0-3: Wrong or missing key concepts entirely
+4-6: Partially correct, important details missing
+7-9: Mostly correct with minor gaps
+10: Complete and accurate
+
+Return only the integer score.

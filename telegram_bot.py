@@ -1,5 +1,7 @@
 import asyncio
 import os
+from typing import Optional
+
 import httpx
 from dotenv import load_dotenv
 
@@ -30,12 +32,17 @@ async def send_message(chat_id: int, text: str):
                           json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
 
 
-async def capture_to_brain(content: str, source: str = "telegram", capture_type: str = "text") -> dict:
+async def capture_to_brain(
+    content: str,
+    source: str = "telegram",
+    capture_type: str = "text",
+    chat_id: Optional[int] = None,
+) -> dict:
+    payload: dict = {"content": content, "source": source, "capture_type": capture_type}
+    if chat_id is not None:
+        payload["metadata"] = {"chat_id": chat_id}
     async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(f"{BRAIN_API}/capture",
-                              headers=BRAIN_HEADERS,
-                              json={"content": content, "source": source,
-                                    "capture_type": capture_type})
+        r = await client.post(f"{BRAIN_API}/capture", headers=BRAIN_HEADERS, json=payload)
         return r.json()
 
 
@@ -70,7 +77,7 @@ async def main():
                     continue
 
                 # Capture it
-                result = await capture_to_brain(text)
+                result = await capture_to_brain(text, chat_id=chat_id)
                 item_id = result.get("id", "?")
                 await send_message(chat_id, f"✅ Captured → classifying\n`{item_id[:8]}...`")
 
