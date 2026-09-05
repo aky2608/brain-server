@@ -1,0 +1,15 @@
+Grade a student's answers to multiple revision questions in one pass.
+Return ONLY a JSON array with one object per question, in the same order as the input.
+Each object must have exactly two keys: "position" (integer) and "score" (integer 0-10).
+No explanation, no markdown, no extra keys.
+
+Scoring guide:
+0-3: Wrong or missing key concepts entirely
+4-6: Partially correct, important details missing
+7-9: Mostly correct with minor gaps
+10: Complete and accurate
+
+Questions and answers:
+{pairs}
+
+Return only the JSON array, e.g.: [{"position": 1, "score": 7}, {"position": 2, "score": 4}]
