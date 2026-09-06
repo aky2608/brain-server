@@ -12,6 +12,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import date
 from typing import Optional
 
 import httpx
@@ -68,8 +69,11 @@ supabase: Client = create_client(
 )
 
 ACTIVE_SOURCES = {"app_voice", "app_text", "app_share", "app_photo", "web_upload", "telegram"}
-ONEMIN_MODEL = "claude-haiku-4-5-20251001"
-FALLBACK_MODEL = "gpt-4o-mini"
+# Claude models are not supported for UNIFY_CHAT_WITH_AI on this 1min.ai account/plan —
+# confirmed via direct API testing. Both models below are verified working.
+# ⚠ gpt-4.1-nano deprecationDate: 2026-10-21 — replace fallback before that date.
+ONEMIN_MODEL = "gpt-4o-mini"
+FALLBACK_MODEL = "gpt-4.1-nano"
 
 _WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
 
@@ -970,6 +974,71 @@ async def get_finance():
             monthly[month_key]["total_items"] += 1
 
     return {"items": items, "monthly": monthly}
+
+
+@app.get("/finance/calendar", dependencies=[Depends(verify_api_key)])
+async def finance_calendar(month: str = Query(default=None)):
+    today = date.today()
+    if month is None:
+        month = f"{today.year}-{today.month:02d}"
+    try:
+        if len(month) != 7 or month[4] != "-":
+            raise ValueError
+        year, mon = int(month[:4]), int(month[5:7])
+        if not (1 <= mon <= 12):
+            raise ValueError
+    except (ValueError, IndexError):
+        raise HTTPException(status_code=400, detail="month must be YYYY-MM")
+
+    month_start = date(year, mon, 1)
+    month_end = date(year + (mon == 12), 1 if mon == 12 else mon + 1, 1)
+
+    try:
+        with _db_conn() as conn:
+            rows = conn.execute(
+                """SELECT
+                       transaction_date,
+                       json_agg(
+                           json_build_object(
+                               'id',        id,
+                               'amount',    amount::text,
+                               'direction', direction,
+                               'merchant',  merchant,
+                               'category',  category
+                           )
+                           ORDER BY id
+                       )                                                            AS transactions,
+                       COALESCE(SUM(amount) FILTER (WHERE direction = 'debit'),  0) AS total_debit,
+                       COALESCE(SUM(amount) FILTER (WHERE direction = 'credit'), 0) AS total_credit
+                   FROM transactions
+                   WHERE transaction_date >= %s
+                     AND transaction_date <  %s
+                   GROUP BY transaction_date
+                   ORDER BY transaction_date""",
+                (month_start, month_end),
+            ).fetchall()
+    except Exception:
+        logger.exception("finance_calendar: DB query failed")
+        raise HTTPException(status_code=500, detail="query failed")
+
+    days = [
+        {
+            "date": str(r[0]),
+            "transactions": r[1],
+            "total_debit": str(r[2]),
+            "total_credit": str(r[3]),
+        }
+        for r in rows
+    ]
+    month_total_debit = str(sum(r[2] for r in rows))
+    month_total_credit = str(sum(r[3] for r in rows))
+
+    return {
+        "month": month,
+        "days": days,
+        "month_total_debit": month_total_debit,
+        "month_total_credit": month_total_credit,
+    }
 
 
 @app.post("/upload-audio", dependencies=[Depends(verify_api_key)])

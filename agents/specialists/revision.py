@@ -33,8 +33,11 @@ from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowMo
 load_dotenv()
 logger = logging.getLogger("brain")
 
-ONEMIN_PRIMARY = "claude-haiku-4-5-20251001"
-ONEMIN_FALLBACK = "gpt-4o-mini"
+# Claude models are not supported for UNIFY_CHAT_WITH_AI on this 1min.ai account/plan —
+# confirmed via direct API testing. Both models below are verified working.
+# ⚠ gpt-4.1-nano deprecationDate: 2026-10-21 — replace fallback before that date.
+ONEMIN_PRIMARY = "gpt-4o-mini"
+ONEMIN_FALLBACK = "gpt-4.1-nano"
 
 SUBJECT_ALIASES: dict[str, str] = {
     "os": "Operating Systems",

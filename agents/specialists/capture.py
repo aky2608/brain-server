@@ -22,8 +22,11 @@ from shortcuts import parse_slash
 
 logger = logging.getLogger("brain")
 
-_ONEMIN_MODEL = "claude-haiku-4-5-20251001"
-_FALLBACK_MODEL = "gpt-4o-mini"
+# Claude models are not supported for UNIFY_CHAT_WITH_AI on this 1min.ai account/plan —
+# confirmed via direct API testing. Both models below are verified working.
+# ⚠ gpt-4.1-nano deprecationDate: 2026-10-21 — replace fallback before that date.
+_ONEMIN_MODEL = "gpt-4o-mini"
+_FALLBACK_MODEL = "gpt-4.1-nano"
 _EMBED_MODEL = "gemini-embedding-001"
 _EMBED_DIMS = 1536  # matches vector(1536) column; truncated from model's native 3072 via outputDimensionality
 

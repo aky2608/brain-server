@@ -52,6 +52,7 @@ class WatchAgent(BaseAgent):
 
         decisions: list[dict] = []
         fired: list[str] = []
+        rules_evaluated = 0
 
         try:
             with psycopg.connect(url) as conn:
@@ -66,12 +67,14 @@ class WatchAgent(BaseAgent):
                     "enabled", "missed_count", "last_notified_at", "last_cleared_at",
                 ]
                 rule_dicts = [dict(zip(cols, r)) for r in rules]
+                rules_evaluated = len(rule_dicts)
 
                 evaluators = {
                     "gate_missed": _eval_gate_missed,
                     "reminder_snoozed": _eval_reminder_snoozed,
                     "interview_prep": _eval_interview_prep,
                     "scheduling_conflict": _eval_scheduling_conflict,
+                    "missed_charge": _eval_missed_charge,
                 }
 
                 for rule in rule_dicts:
@@ -97,19 +100,19 @@ class WatchAgent(BaseAgent):
         except Exception:
             logger.exception("watch_agent: DB error during rule evaluation")
             return WatchOutput(
-                rules_evaluated=0, interrupts_fired=fired, decisions=decisions
+                rules_evaluated=rules_evaluated, interrupts_fired=fired, decisions=decisions
             )
 
         logger.info(
             "watch_agent complete",
             extra={"ctx": {
                 "trigger": input.trigger,
-                "rules_evaluated": len(rule_dicts) if "rule_dicts" in dir() else 0,
+                "rules_evaluated": rules_evaluated,
                 "interrupts_fired": fired,
             }},
         )
         return WatchOutput(
-            rules_evaluated=len(rule_dicts) if "rule_dicts" in dir() else 0,
+            rules_evaluated=rules_evaluated,
             interrupts_fired=fired,
             decisions=decisions,
         )
@@ -309,6 +312,45 @@ def _eval_interview_prep(conn: psycopg.Connection, rule: dict) -> Optional[dict]
     return _decision(
         action_taken="watch_interview_prep",
         reason=f"Interview in ≤{days_warning}d with zero prep entries this week",
+        interrupt_tier=rule["interrupt_tier"],
+    )
+
+
+def _eval_missed_charge(conn: psycopg.Connection, rule: dict) -> Optional[dict]:
+    """
+    Recurring charges where next_expected_date has passed the grace period
+    and no transaction has landed since last_seen_date.
+
+    Auto-resolves without status mutation: when the late charge finally arrives,
+    _update_recurrence advances next_expected_date, clearing the NOT EXISTS check
+    on the next WatchAgent run. status='missed' is only set by explicit user action.
+    """
+    cond = rule.get("condition") or {}
+    grace = int(cond.get("grace_period_days", 3))
+
+    overdue = conn.execute(
+        """SELECT rg.merchant, rg.expected_amount, rg.next_expected_date
+           FROM recurrence_groups rg
+           WHERE rg.status = 'active'
+             AND rg.next_expected_date < CURRENT_DATE - %s
+             AND NOT EXISTS (
+                 SELECT 1 FROM transactions t
+                 WHERE lower(t.merchant) = lower(rg.merchant)
+                   AND t.transaction_date > rg.last_seen_date
+             )""",
+        (grace,),
+    ).fetchall()
+
+    if not overdue:
+        return None
+
+    if not _cooldown_elapsed(rule):
+        return None
+
+    merchants = ", ".join(r[0] for r in overdue)
+    return _decision(
+        action_taken="watch_missed_charge",
+        reason=f"{len(overdue)} recurring charge(s) overdue >{grace}d: {merchants}",
         interrupt_tier=rule["interrupt_tier"],
     )
 
