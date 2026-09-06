@@ -19,6 +19,7 @@ from agents.base import GraphState
 from agents.personal import personal_agent_node, route_from_personal
 from agents.specialists.capture import capture_agent_node
 from agents.specialists.echo import EchoInput, echo_agent_node
+from agents.specialists.finance import finance_agent_node
 from agents.specialists.notebook import notebook_agent_node
 from agents.specialists.revision import revision_agent_node
 from agents.specialists.scheduling import scheduling_agent_node
@@ -35,6 +36,7 @@ def build_graph(checkpointer: PostgresSaver):
     builder.add_node("personal_agent", personal_agent_node)
     builder.add_node("capture_agent", capture_agent_node)
     builder.add_node("echo_agent", echo_agent_node)
+    builder.add_node("finance_agent", finance_agent_node)
     builder.add_node("scheduling_agent", scheduling_agent_node)
     builder.add_node("why_agent", why_agent_node)
     builder.add_node("notebook_agent", notebook_agent_node)
@@ -45,6 +47,7 @@ def build_graph(checkpointer: PostgresSaver):
     builder.add_conditional_edges("personal_agent", route_from_personal)
     builder.add_edge("capture_agent", "personal_agent")
     builder.add_edge("echo_agent", "personal_agent")
+    builder.add_edge("finance_agent", "personal_agent")
     builder.add_edge("notebook_agent", "personal_agent")
     builder.add_edge("revision_agent", "personal_agent")
     builder.add_edge("scheduling_agent", "personal_agent")

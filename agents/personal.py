@@ -24,6 +24,7 @@ DISPATCH_MAP: dict[str, str] = {
     "watch_agent": "watch_agent",            # zero-LLM watch rule evaluator (Phase 2.7)
     "notebook_agent": "notebook_agent",      # /gate → GATE subject notebook routing
     "revision_agent": "revision_agent",      # /revise → spaced repetition
+    "finance_agent": "finance_agent",        # chained after capture_agent for life/finance items
 }
 
 
@@ -73,9 +74,10 @@ def personal_agent_node(state: GraphState) -> dict:
         Every routing decision is written to agent_decisions before returning.
     """
     if state.get("specialist_result") is not None:
+        result = state["specialist_result"] or {}
         # Relay any decisions a specialist surfaced — sole-writer invariant: only
         # personal_agent writes to agent_decisions; specialists return decisions for us to log.
-        for d in (state["specialist_result"] or {}).get("decisions", []):
+        for d in result.get("decisions", []):
             _log_decision(
                 agent_name=d.get("agent_name", "scheduling_agent"),
                 action_taken=d.get("action_taken", ""),
@@ -83,6 +85,10 @@ def personal_agent_node(state: GraphState) -> dict:
                 interrupt_tier=d.get("interrupt_tier", "log_only"),
                 item_id=d.get("item_id"),
             )
+        # Chain to finance_agent when capture_agent classifies a life/finance item.
+        # finance_agent's output has no subcategory key, so this fires exactly once.
+        if result.get("subcategory") == "finance" and result.get("item_id"):
+            return {"routed_to": "finance_agent", "specialist_result": None}
         return {"routed_to": None}
 
     raw = (state.get("raw_input") or "").strip()

@@ -1,0 +1,29 @@
+Decide whether the text below records a specific financial transaction, then extract details if it does.
+
+A transaction is: a payment, purchase, expense, income event, or loan where an explicit amount changed hands.
+NOT a transaction: news articles, policy discussions, reminders that something will expire, budget notes, questions, opinions.
+
+Return ONLY valid JSON, no other text, no markdown.
+
+If this is NOT a transaction:
+{{"is_transaction": false}}
+
+If this IS a transaction:
+{{
+  "is_transaction": true,
+  "amount": <total numeric value in rupees — sum if multiple items in one event>,
+  "direction": "debit",
+  "merchant": <payee, vendor, or person name — null if unclear>,
+  "category": <one of: groceries|food|transport|subscriptions|utilities|rent|medical|shopping|loan|transfer|other>,
+  "date": <YYYY-MM-DD if explicitly mentioned, else null>
+}}
+
+Rules:
+- direction is almost always "debit" for personal expense captures; use "credit" only for money received or credited.
+- "lent to X" or "gave X" = debit (money left the user). "received from X" = credit.
+- Do not infer or guess amounts. Only extract what is explicitly stated.
+- A reminder that a subscription will expire is NOT a transaction — no money moved yet.
+- If two items are mentioned in one event ("4520 on dress, 180 on food"), sum the amounts into one transaction.
+- Amounts stated as plain numbers without currency are rupees (this is an Indian personal finance context).
+
+Text: {raw_content}
