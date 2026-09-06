@@ -976,6 +976,31 @@ async def get_finance():
     return {"items": items, "monthly": monthly}
 
 
+@app.get("/finance/infra-cost", dependencies=[Depends(verify_api_key)])
+async def finance_infra_cost():
+    try:
+        with _db_conn() as conn:
+            rows = conn.execute(
+                "SELECT item, amount_inr, note FROM infra_costs ORDER BY amount_inr DESC, item"
+            ).fetchall()
+    except Exception:
+        logger.exception("finance_infra_cost: DB query failed")
+        raise HTTPException(status_code=500, detail="query failed")
+
+    return {
+        "monthly_fixed_costs": [
+            {"item": r[0], "amount_inr": str(r[1]), "note": r[2]}
+            for r in rows
+        ],
+        "total_monthly_inr": str(sum(r[1] for r in rows)),
+        "note": (
+            "Static figures from PROJECT_BIBLE §15, converted to INR at 94.49 INR/USD (2026-09-06). "
+            "Real per-call LLM cost tracking is deliberately deferred — "
+            "v1 is static config, not computed spend."
+        ),
+    }
+
+
 @app.get("/finance/calendar", dependencies=[Depends(verify_api_key)])
 async def finance_calendar(month: str = Query(default=None)):
     today = date.today()
