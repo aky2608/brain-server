@@ -35,6 +35,34 @@ _MAX_SIM_LINKS = 5
 
 SHADOW_MODE = False
 
+_EXTRACT_SUBCATEGORIES   = frozenset({"finance", "quotes", "wayclear", "accrediq"})
+# 'finance' included because the LLM sometimes outputs category=finance instead of life/finance
+_EXTRACT_NULL_CATEGORIES = frozenset({"thoughts", "life", "finance"})
+
+
+def _should_extract_people(category: Optional[str], subcategory: Optional[str]) -> bool:
+    # Normalize the string literal 'null' the LLM emits to Python None
+    if subcategory == "null":
+        subcategory = None
+    if subcategory in _EXTRACT_SUBCATEGORIES:
+        return True
+    if subcategory is None and category in _EXTRACT_NULL_CATEGORIES:
+        return True
+    return False
+
+
+def _enqueue_people_extraction(item_id: str, raw_content: str, source: str) -> None:
+    url = os.environ.get("BRAIN_DB_URL", "")
+    if not url:
+        return
+    with psycopg.connect(url) as conn:
+        conn.execute(
+            "INSERT INTO job_queue (job_type, payload) VALUES ('people_extraction', %s)",
+            (Jsonb({"item_id": item_id, "raw_content": raw_content, "source": source}),),
+        )
+        conn.commit()
+
+
 _WIKILINK_RE = re.compile(r'\[\[([^\[\]]+)\]\]')
 
 _PROMPT_TMPL: Optional[str] = None
@@ -128,6 +156,15 @@ class CaptureAgent(BaseAgent):
                     if vector:
                         links_created += _link_embeddings(input.capture_uuid, vector, conn)
                     conn.commit()
+                if _should_extract_people(cls.get("category"), cls.get("subcategory")):
+                    try:
+                        _enqueue_people_extraction(input.capture_uuid, input.raw, input.source)
+                    except Exception:
+                        logger.warning(
+                            "people_extraction enqueue failed",
+                            extra={"ctx": {"item_id": input.capture_uuid}},
+                            exc_info=True,
+                        )
             except Exception:
                 logger.error(
                     "capture_agent write phase failed",

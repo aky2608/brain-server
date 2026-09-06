@@ -514,6 +514,14 @@ async def job_queue_worker() -> None:
                 if job["job_type"] == "graph_invoke":
                     p = job["payload"]
                     await _invoke_graph_bg(p["item_id"], p["content"], p["source"])
+                elif job["job_type"] == "people_extraction":
+                    from agents.specialists.people import run_people_extraction
+                    p = job["payload"]
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None, run_people_extraction,
+                        p["item_id"], p["raw_content"], p.get("source", ""),
+                    )
                 else:
                     raise ValueError(f"unknown job_type: {job['job_type']!r}")
                 _mark_job_done(job["id"])

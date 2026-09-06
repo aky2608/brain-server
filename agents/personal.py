@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from typing import Optional
 
 import psycopg
@@ -8,6 +9,8 @@ from langgraph.graph import END
 
 from agents.base import GraphState
 from shortcuts import lookup_shortcut, parse_slash
+
+_CONFLICT_RE = re.compile(r"^(yes|no|skip)(?:\s+([0-9a-f]{6}))?(?=\s|$)", re.IGNORECASE)
 
 load_dotenv()
 
@@ -25,11 +28,44 @@ DISPATCH_MAP: dict[str, str] = {
     "notebook_agent": "notebook_agent",      # /gate → GATE subject notebook routing
     "revision_agent": "revision_agent",      # /revise → spaced repetition
     "finance_agent": "finance_agent",        # chained after capture_agent for life/finance items
+    "people_agent": "people_agent",          # /people pending + conflict resolution
 }
 
 
 def _db_url() -> str:
     return os.environ.get("BRAIN_DB_URL", "")
+
+
+def _get_pending_conflicts() -> list[dict]:
+    url = _db_url()
+    if not url:
+        return []
+    try:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(
+                """SELECT id FROM people_conflicts
+                   WHERE status = 'pending'
+                   ORDER BY created_at LIMIT 5"""
+            ).fetchall()
+        return [{"id": str(r[0])} for r in rows]
+    except Exception:
+        logger.exception("people_conflicts poll failed")
+        return []
+
+
+def _write_outbox_direct(recipient: str, message: str) -> None:
+    url = _db_url()
+    if not url:
+        return
+    try:
+        with psycopg.connect(url) as conn:
+            conn.execute(
+                "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
+                (recipient, message),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("outbox write failed in personal_agent")
 
 
 def _log_decision(
@@ -94,6 +130,47 @@ def personal_agent_node(state: GraphState) -> dict:
     raw = (state.get("raw_input") or "").strip()
     lower = raw.lower()
 
+    # 0. Conflict reply — YES/NO/SKIP [6-char code], checked before any other routing.
+    m = _CONFLICT_RE.match(raw)
+    if m:
+        pending = _get_pending_conflicts()
+        if pending:
+            answer = m.group(1).lower()
+            code   = m.group(2).lower() if m.group(2) else None
+            if code:
+                conflict = next(
+                    (c for c in pending if str(c["id"]).replace("-", "")[-6:] == code), None
+                )
+                if conflict:
+                    _log_decision("people_agent", f"resolve_conflict:{answer}:{code}",
+                                  "conflict reply with explicit code")
+                    return {
+                        "routed_to": "people_agent", "specialist_result": None,
+                        "people_action": "resolve_conflict",
+                        "conflict_id": conflict["id"], "conflict_answer": answer,
+                    }
+                known = ", ".join(str(c["id"]).replace("-", "")[-6:] for c in pending)
+                _write_outbox_direct(state.get("source", ""),
+                                     f"Code {code} not found. Open: {known}")
+                return {"routed_to": None, "specialist_result": {"handled": "conflict_code_unknown"}}
+            elif len(pending) == 1:
+                _log_decision("people_agent", f"resolve_conflict:{answer}:implicit",
+                              "single open conflict, no code needed")
+                return {
+                    "routed_to": "people_agent", "specialist_result": None,
+                    "people_action": "resolve_conflict",
+                    "conflict_id": pending[0]["id"], "conflict_answer": answer,
+                }
+            else:
+                known = ", ".join(str(c["id"]).replace("-", "")[-6:] for c in pending)
+                first_code = str(pending[0]["id"]).replace("-", "")[-6:]
+                _write_outbox_direct(
+                    state.get("source", ""),
+                    f"Multiple open conflicts \u2014 include the code, e.g. YES {first_code}\nOpen: {known}",
+                )
+                return {"routed_to": None, "specialist_result": {"handled": "conflict_ambiguous"}}
+        # CONFLICT_RE matched but no pending conflicts — fall through to normal routing.
+
     # 1. why/explain hard fork — no LLM; reads agent_decisions
     if lower.startswith("why") or lower.startswith("explain"):
         _log_decision(
@@ -105,6 +182,21 @@ def personal_agent_node(state: GraphState) -> dict:
 
     # 2. Slash command: /alias [rest of text]
     alias = parse_slash(raw)
+
+    # /people subcommands — handled before capture_shortcuts lookup.
+    if alias == "people":
+        subcommand = raw.strip()[len("/people"):].strip().lower()
+        if subcommand == "pending":
+            _log_decision("people_agent", "route_slash:people:pending", "/people pending")
+            return {
+                "routed_to": "people_agent", "specialist_result": None,
+                "people_action": "list_pending",
+                "conflict_id": None, "conflict_answer": None,
+            }
+        _log_decision("echo_agent", f"route_slash_unknown:people:{subcommand}",
+                      f"/people {subcommand!r} not a known subcommand")
+        return {"routed_to": "echo"}
+
     if alias is not None:
         shortcut = lookup_shortcut(alias)
         if shortcut:

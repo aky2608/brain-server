@@ -26,6 +26,9 @@ class GraphState(TypedDict):
     capture_uuid: Optional[str]
     routed_to: Optional[str]
     specialist_result: Optional[dict]
+    people_action: Optional[str]    # resolve_conflict | list_pending
+    conflict_id: Optional[str]      # UUID of conflict being resolved
+    conflict_answer: Optional[str]  # yes | no | skip
 
 
 class NarrowModel(BaseModel):

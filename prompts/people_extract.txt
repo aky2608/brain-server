@@ -1,0 +1,27 @@
+Extract all person names mentioned in the text below.
+
+A person name is: any proper name referring to a human being — first name, full name, or nickname.
+NOT a person: company names, place names, app names, product names, brand names.
+
+Return ONLY valid JSON, no other text, no markdown.
+
+If no person names are found:
+{{"people": []}}
+
+If person names are found:
+{{
+  "people": [
+    {{"name": "<name as written>", "context": "<3-10 word phrase showing how this person appears>"}}
+  ]
+}}
+
+Rules:
+- Preserve capitalisation exactly as written.
+- If only one form of a name appears in the text, extract it exactly as written — do not shorten, simplify, or drop any part of it, even if it looks like a common first name alone.
+- NEVER correct spelling, NEVER normalize to a more common variant — extract the exact character sequence as it appears, including apparent misspellings or unusual spellings.
+- One entry per distinct person — if "Athira" appears twice, include once.
+- If both full name and short form appear in the same text ("Athira Menon", "Athira"), include the longer form only.
+- Do not infer or guess. Only extract names explicitly present in the text.
+- Do not include the user themselves (first-person references: I, me, my, myself).
+
+Text: {raw_content}
