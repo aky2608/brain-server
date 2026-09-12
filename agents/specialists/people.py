@@ -62,7 +62,8 @@ def should_extract_people(category: Optional[str], subcategory: Optional[str]) -
 
 class PeopleInput(NarrowModel):
     people_action: str              # resolve_conflict | list_pending
-    source: str                     # Telegram chat ID — outbox recipient
+    source: str                     # channel name ("telegram") — fallback if chat_id lookup fails
+    item_id: Optional[str] = None   # items.id of the triggering message; used to look up metadata.chat_id
     conflict_id: Optional[str] = None
     conflict_answer: Optional[str] = None   # yes | no | skip
 
@@ -108,6 +109,10 @@ class PeopleAgent(BaseAgent):
 
         answer = input.conflict_answer.lower()
         with psycopg.connect(url) as conn:
+            chat_id_row = conn.execute(
+                "SELECT metadata->>'chat_id' FROM items WHERE id = %s", (input.item_id,)
+            ).fetchone() if input.item_id else None
+            recipient = str(chat_id_row[0]) if chat_id_row and chat_id_row[0] else input.source
             row = conn.execute(
                 "SELECT candidate_person_id, mention_text FROM people_conflicts WHERE id = %s",
                 (input.conflict_id,),
@@ -183,7 +188,7 @@ class PeopleAgent(BaseAgent):
 
             conn.execute(
                 "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
-                (input.source, reply),
+                (recipient, reply),
             )
             conn.commit()
 
@@ -201,6 +206,10 @@ class PeopleAgent(BaseAgent):
 
     def _list_pending(self, input: PeopleInput, url: str) -> PeopleOutput:
         with psycopg.connect(url) as conn:
+            chat_id_row = conn.execute(
+                "SELECT metadata->>'chat_id' FROM items WHERE id = %s", (input.item_id,)
+            ).fetchone() if input.item_id else None
+            recipient = str(chat_id_row[0]) if chat_id_row and chat_id_row[0] else input.source
             rows = conn.execute(
                 """SELECT pc.id, pc.mention_text, pc.similarity_score, pc.status,
                           p.name AS candidate_name, p.status AS person_status,
@@ -227,7 +236,7 @@ class PeopleAgent(BaseAgent):
 
             conn.execute(
                 "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
-                (input.source, msg),
+                (recipient, msg),
             )
             conn.commit()
 
@@ -269,12 +278,17 @@ def run_people_extraction(item_id: str, raw_content: str, source: str) -> None:
 
     try:
         with psycopg.connect(url) as conn:
+            row = conn.execute(
+                "SELECT metadata->>'chat_id' FROM items WHERE id = %s", (item_id,)
+            ).fetchone()
+            chat_id = str(row[0]) if row and row[0] else source
+
             for entry in names:
                 # Per-name savepoint: people + people_mentions are atomic together.
                 # If either INSERT fails, sp_name rollback undoes both — no orphan people rows.
                 conn.execute("SAVEPOINT sp_name")
                 try:
-                    _process_name(conn, item_id, entry["name"], entry["context"], source)
+                    _process_name(conn, item_id, entry["name"], entry["context"], chat_id)
                     conn.execute("RELEASE SAVEPOINT sp_name")
                 except Exception:
                     conn.execute("ROLLBACK TO SAVEPOINT sp_name")
@@ -427,6 +441,7 @@ def people_agent_node(state: GraphState) -> dict:
     result = _agent.handle(PeopleInput(
         people_action=state.get("people_action") or "",
         source=state.get("source") or "",
+        item_id=state.get("capture_uuid"),
         conflict_id=state.get("conflict_id"),
         conflict_answer=state.get("conflict_answer"),
     ))

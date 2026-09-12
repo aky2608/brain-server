@@ -44,7 +44,7 @@ def _get_pending_conflicts() -> list[dict]:
         with psycopg.connect(url) as conn:
             rows = conn.execute(
                 """SELECT id FROM people_conflicts
-                   WHERE status = 'pending'
+                   WHERE status IN ('pending', 'snoozed')
                    ORDER BY created_at LIMIT 5"""
             ).fetchall()
         return [{"id": str(r[0])} for r in rows]
