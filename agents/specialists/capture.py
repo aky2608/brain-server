@@ -63,6 +63,29 @@ def _enqueue_people_extraction(item_id: str, raw_content: str, source: str) -> N
         conn.commit()
 
 
+def _record_project_activity_capture(item_id: str, subcategory: Optional[str],
+                                      action_class: Optional[str], raw: str) -> None:
+    if not subcategory or subcategory == "null":
+        return
+    url = os.environ.get("BRAIN_DB_URL", "")
+    if not url:
+        return
+    with psycopg.connect(url) as conn:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE alias = %s AND status = 'active'",
+            (subcategory,),
+        ).fetchone()
+        if row is None:
+            return
+        summary = f"[{action_class or 'note'}] {raw[:120]}"
+        conn.execute(
+            """INSERT INTO project_activity (project_id, event_type, item_id, summary)
+               VALUES (%s, 'capture', %s, %s)""",
+            (str(row[0]), item_id, summary),
+        )
+        conn.commit()
+
+
 _WIKILINK_RE = re.compile(r'\[\[([^\[\]]+)\]\]')
 
 _PROMPT_TMPL: Optional[str] = None
@@ -165,6 +188,19 @@ class CaptureAgent(BaseAgent):
                             extra={"ctx": {"item_id": input.capture_uuid}},
                             exc_info=True,
                         )
+                try:
+                    _record_project_activity_capture(
+                        input.capture_uuid,
+                        cls.get("subcategory"),
+                        cls.get("action_class"),
+                        input.raw,
+                    )
+                except Exception:
+                    logger.warning(
+                        "project_activity capture record failed",
+                        extra={"ctx": {"item_id": input.capture_uuid}},
+                        exc_info=True,
+                    )
             except Exception:
                 logger.error(
                     "capture_agent write phase failed",

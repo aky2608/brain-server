@@ -51,7 +51,8 @@
       "Bash(journalctl -u brain-api --since=\"2026-09-03\" --until=\"2026-09-05 19:00:00\" --no-pager -o short)",
       "Bash(awk -F'brain-api\\\\[' '{print $2}')",
       "Read(//var/www/finance/**)",
-      "Bash(venv/bin/alembic current *)"
+      "Bash(venv/bin/alembic current *)",
+      "Bash(/opt/brain/venv/bin/python *)"
     ]
   }
 }

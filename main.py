@@ -429,6 +429,32 @@ async def batch_classification_loop():
 # Job queue worker
 # ---------------------------------------------------------------------------
 
+def _record_project_activity_task_done(item_id: str) -> None:
+    with psycopg.connect(_db_url()) as conn:
+        item_row = conn.execute(
+            "SELECT subcategory, raw_content FROM items WHERE id = %s",
+            (item_id,),
+        ).fetchone()
+        if item_row is None:
+            return
+        subcategory, raw_content = item_row
+        if not subcategory or subcategory == "null":
+            return
+        proj_row = conn.execute(
+            "SELECT id FROM projects WHERE alias = %s AND status = 'active'",
+            (subcategory,),
+        ).fetchone()
+        if proj_row is None:
+            return
+        summary = f"Completed: {(raw_content or '')[:120]}"
+        conn.execute(
+            """INSERT INTO project_activity (project_id, event_type, item_id, summary)
+               VALUES (%s, 'task_done', %s, %s)""",
+            (str(proj_row[0]), item_id, summary),
+        )
+        conn.commit()
+
+
 def _enqueue_graph_invoke(item_id: str, content: str, source: str) -> None:
     with psycopg.connect(_db_url()) as conn:
         conn.execute(
@@ -829,6 +855,12 @@ async def update_item(item_id: str, updates: dict):
     result = supabase.table("items").update(filtered).eq("id", item_id).execute()
     if "task_status" in filtered:
         _enqueue_graph_invoke(item_id, "/plan", "system")
+        if filtered["task_status"] == "done":
+            try:
+                _record_project_activity_task_done(item_id)
+            except Exception:
+                logger.warning("project_activity task_done record failed",
+                               extra={"ctx": {"item_id": item_id}}, exc_info=True)
     return result.data[0]
 
 
@@ -1212,6 +1244,107 @@ def _mention_snippet(raw: str, title: str, window: int = 120) -> str:
     if end < len(raw):
         snippet = snippet + "…"
     return snippet
+
+
+class ProjectCreateInput(BaseModel):
+    name: str
+    alias: str
+
+
+_ALIAS_RE = re.compile(r'^[a-z][a-z0-9_-]*$')
+
+
+@app.post("/projects", dependencies=[Depends(verify_api_key)], status_code=201)
+async def create_project(data: ProjectCreateInput):
+    name = data.name.strip()
+    alias = data.alias.strip()
+    if not name:
+        raise HTTPException(400, "name must not be blank")
+    if not _ALIAS_RE.match(alias):
+        raise HTTPException(400, "alias must be lowercase letters, digits, hyphens or underscores, starting with a letter")
+    with _db_conn() as conn:
+        existing = conn.execute(
+            "SELECT id FROM projects WHERE alias = %s", (alias,)
+        ).fetchone()
+        if existing:
+            raise HTTPException(409, f"alias '{alias}' is already taken")
+        nb_row = conn.execute(
+            """INSERT INTO notebooks (name, notebook_type)
+               VALUES (%s, 'project')
+               ON CONFLICT ON CONSTRAINT uq_notebooks_name_type
+               DO UPDATE SET archived_at = NULL
+               RETURNING id""",
+            (name,),
+        ).fetchone()
+        notebook_id = nb_row[0]
+        proj_row = conn.execute(
+            """INSERT INTO projects (name, alias, notebook_id)
+               VALUES (%s, %s, %s)
+               RETURNING id, name, alias, notebook_id, status, created_at""",
+            (name, alias, notebook_id),
+        ).fetchone()
+        project_id = str(proj_row[0])
+        conn.execute(
+            """INSERT INTO project_activity (project_id, event_type, summary)
+               VALUES (%s, 'project_created', %s)""",
+            (project_id, f"Project created: {name}"),
+        )
+        conn.commit()
+    return {
+        "id": project_id,
+        "name": proj_row[1],
+        "alias": proj_row[2],
+        "notebook_id": proj_row[3],
+        "status": proj_row[4],
+        "created_at": proj_row[5].isoformat(),
+    }
+
+
+@app.get("/projects", dependencies=[Depends(verify_api_key)])
+async def list_projects(status: Optional[str] = None):
+    if status and status not in ("active", "archived"):
+        raise HTTPException(400, "status must be 'active' or 'archived'")
+    with _db_conn() as conn:
+        if status:
+            rows = conn.execute(
+                """SELECT id, name, alias, notebook_id, status, created_at, archived_at
+                   FROM projects WHERE status = %s ORDER BY created_at DESC""",
+                (status,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """SELECT id, name, alias, notebook_id, status, created_at, archived_at
+                   FROM projects ORDER BY created_at DESC""",
+            ).fetchall()
+    return {"projects": [
+        {
+            "id": str(r[0]), "name": r[1], "alias": r[2], "notebook_id": r[3],
+            "status": r[4], "created_at": r[5].isoformat(),
+            "archived_at": r[6].isoformat() if r[6] else None,
+        }
+        for r in rows
+    ]}
+
+
+@app.patch("/projects/{project_id}/archive", dependencies=[Depends(verify_api_key)])
+async def archive_project(project_id: str):
+    with _db_conn() as conn:
+        row = conn.execute(
+            """UPDATE projects
+               SET status = 'archived', archived_at = now()
+               WHERE id = %s AND status = 'active'
+               RETURNING id, name""",
+            (project_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "project not found or already archived")
+        conn.execute(
+            """INSERT INTO project_activity (project_id, event_type, summary)
+               VALUES (%s, 'project_archived', 'Project archived')""",
+            (str(row[0]),),
+        )
+        conn.commit()
+    return {"id": str(row[0]), "name": row[1], "status": "archived"}
 
 
 @app.get("/items/{item_id}/backlinks", dependencies=[Depends(verify_api_key)])
