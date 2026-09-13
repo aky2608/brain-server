@@ -52,7 +52,8 @@
       "Bash(awk -F'brain-api\\\\[' '{print $2}')",
       "Read(//var/www/finance/**)",
       "Bash(venv/bin/alembic current *)",
-      "Bash(/opt/brain/venv/bin/python *)"
+      "Bash(/opt/brain/venv/bin/python *)",
+      "Bash(systemctl is-active *)"
     ]
   }
 }
