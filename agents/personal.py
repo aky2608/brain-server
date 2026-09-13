@@ -29,6 +29,7 @@ DISPATCH_MAP: dict[str, str] = {
     "revision_agent": "revision_agent",      # /revise → spaced repetition
     "finance_agent": "finance_agent",        # chained after capture_agent for life/finance items
     "people_agent": "people_agent",          # /people pending + conflict resolution
+    "project_agent": "project_agent",        # /build → Coding Agent spec packaging
 }
 
 

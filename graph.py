@@ -25,6 +25,7 @@ from agents.specialists.revision import revision_agent_node
 from agents.specialists.scheduling import scheduling_agent_node
 from agents.specialists.watch import watch_agent_node
 from agents.specialists.people import people_agent_node
+from agents.specialists.project import project_agent_node
 from agents.specialists.why import why_agent_node
 
 load_dotenv()
@@ -44,6 +45,7 @@ def build_graph(checkpointer: PostgresSaver):
     builder.add_node("revision_agent", revision_agent_node)
     builder.add_node("watch_agent", watch_agent_node)
     builder.add_node("people_agent", people_agent_node)
+    builder.add_node("project_agent", project_agent_node)
 
     builder.set_entry_point("personal_agent")
     builder.add_conditional_edges("personal_agent", route_from_personal)
@@ -56,6 +58,7 @@ def build_graph(checkpointer: PostgresSaver):
     builder.add_edge("why_agent", "personal_agent")
     builder.add_edge("watch_agent", "personal_agent")
     builder.add_edge("people_agent", "personal_agent")
+    builder.add_edge("project_agent", "personal_agent")
 
     return builder.compile(checkpointer=checkpointer)
 
