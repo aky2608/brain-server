@@ -50,6 +50,9 @@ logger.propagate = False
 API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise RuntimeError("API_KEY not set")
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+if not GITHUB_TOKEN:
+    raise RuntimeError("GITHUB_TOKEN not set")
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -569,12 +572,12 @@ async def job_queue_worker() -> None:
 def _poll_outbox() -> list[dict]:
     with psycopg.connect(_db_url()) as conn:
         rows = conn.execute(
-            """SELECT id, channel, recipient, message, attempts
+            """SELECT id, channel, recipient, message, attempts, reply_markup
                FROM outbox WHERE status='pending'
                ORDER BY created_at LIMIT 10"""
         ).fetchall()
     return [{"id": str(r[0]), "channel": r[1], "recipient": r[2],
-             "message": r[3], "attempts": r[4]} for r in rows]
+             "message": r[3], "attempts": r[4], "reply_markup": r[5]} for r in rows]
 
 
 def _mark_outbox_sent(outbox_id: str) -> None:
@@ -609,11 +612,16 @@ async def outbox_delivery_loop() -> None:
                 try:
                     if row["channel"] == "telegram":
                         async with httpx.AsyncClient(timeout=10) as client:
+                            payload: dict = {
+                                "chat_id": int(row["recipient"]),
+                                "text": row["message"],
+                                "parse_mode": "Markdown",
+                            }
+                            if row.get("reply_markup"):
+                                payload["reply_markup"] = row["reply_markup"]
                             r = await client.post(
                                 f"{tg_base}/sendMessage",
-                                json={"chat_id": int(row["recipient"]),
-                                      "text": row["message"],
-                                      "parse_mode": "Markdown"},
+                                json=payload,
                             )
                             r.raise_for_status()
                         _mark_outbox_sent(row["id"])
@@ -1569,3 +1577,110 @@ async def get_item_graph(item_id: str):
         "node_count": len(nodes),
         "edge_count": len(edges),
     }
+
+
+# ---------------------------------------------------------------------------
+# Build actions: promote / kill
+# ---------------------------------------------------------------------------
+
+def _parse_github_repo(repo_url: str) -> tuple[str, str]:
+    m = re.search(r"github\.com[:/]([^/]+)/([^/.]+)", repo_url)
+    if not m:
+        raise ValueError(f"cannot parse GitHub repo from {repo_url!r}")
+    return m.group(1), m.group(2)
+
+
+def _get_approval_for_action(approval_id: str) -> dict | None:
+    with psycopg.connect(_db_url()) as conn:
+        row = conn.execute(
+            """SELECT pa.id, pa.status, pa.branch, pa.spec,
+                      p.repo_url, p.default_branch
+               FROM pending_approvals pa
+               JOIN projects p ON p.id = pa.project_id
+               WHERE pa.id = %s""",
+            (approval_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": str(row[0]), "status": row[1], "branch": row[2],
+        "spec": row[3], "repo_url": row[4], "default_branch": row[5],
+    }
+
+
+def _set_terminal_status(approval_id: str, status: str) -> bool:
+    """UPDATE only if status is still awaiting_review. Returns True if the row was claimed."""
+    with psycopg.connect(_db_url()) as conn:
+        cur = conn.execute(
+            """UPDATE pending_approvals
+               SET status=%s, resolved_at=now()
+               WHERE id=%s AND status='awaiting_review'""",
+            (status, approval_id),
+        )
+        conn.commit()
+    return cur.rowcount == 1
+
+
+@app.post("/build/{approval_id}/promote", dependencies=[Depends(verify_api_key)])
+async def promote_build(approval_id: str):
+    approval = _get_approval_for_action(approval_id)
+    if approval is None:
+        raise HTTPException(404, "approval not found")
+
+    if not _set_terminal_status(approval_id, "approved"):
+        current = (_get_approval_for_action(approval_id) or {}).get("status", "unknown")
+        raise HTTPException(409, f"already {current}")
+
+    owner, repo = _parse_github_repo(approval["repo_url"])
+    task_title = (approval["spec"].get("task") or "")[:200]
+    branch = approval["branch"]
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # head is a plain branch name — correct for same-repo PRs.
+        # For fork-based projects, head would need "owner:branch" form.
+        r = await client.post(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls",
+            headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={
+                "title": task_title,
+                "head": branch,
+                "base": approval["default_branch"],
+                "body": "Auto-generated by brain-builder.",
+            },
+        )
+        r.raise_for_status()
+        pr = r.json()
+
+    return {"pr_url": pr["html_url"], "pr_number": pr["number"]}
+
+
+@app.post("/build/{approval_id}/kill", dependencies=[Depends(verify_api_key)])
+async def kill_build(approval_id: str):
+    approval = _get_approval_for_action(approval_id)
+    if approval is None:
+        raise HTTPException(404, "approval not found")
+
+    if not _set_terminal_status(approval_id, "killed"):
+        current = (_get_approval_for_action(approval_id) or {}).get("status", "unknown")
+        raise HTTPException(409, f"already {current}")
+
+    owner, repo = _parse_github_repo(approval["repo_url"])
+    branch = approval["branch"]
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # Deletes only the remote ref — local workspace checkout is untouched.
+        r = await client.delete(
+            f"https://api.github.com/repos/{owner}/{repo}/git/refs/heads/{branch}",
+            headers={
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        # 422 means the ref is already gone; treat as success.
+        if r.status_code not in (204, 422):
+            r.raise_for_status()
+
+    return {"killed": True, "branch": branch}
