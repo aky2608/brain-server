@@ -1,0 +1,18 @@
+[Unit]
+Description=Brain builder (Aider worker for pending_approvals)
+After=network.target
+
+[Service]
+Type=simple
+User=ashish
+WorkingDirectory=/opt/brain
+EnvironmentFile=/opt/brain/.env
+ExecStart=/opt/brain/venv/bin/python /opt/brain/builder.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=brain-builder
+
+[Install]
+WantedBy=multi-user.target
