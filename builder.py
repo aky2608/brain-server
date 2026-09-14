@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import shutil
 import signal
 import tempfile
@@ -11,6 +12,7 @@ import time
 import uuid
 
 import psycopg
+from psycopg.types.json import Jsonb
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -94,12 +96,12 @@ def _claim_next_approval() -> dict | None:
 def _get_project(project_id: str) -> dict:
     with psycopg.connect(_db_url()) as conn:
         row = conn.execute(
-            "SELECT local_path, default_branch FROM projects WHERE id = %s",
+            "SELECT local_path, default_branch, repo_url FROM projects WHERE id = %s",
             (project_id,),
         ).fetchone()
     if row is None:
         raise RuntimeError(f"project {project_id!r} not found")
-    return {"local_path": row[0], "default_branch": row[1]}
+    return {"local_path": row[0], "default_branch": row[1], "repo_url": row[2]}
 
 
 def _get_next_attempt(approval_id: str) -> int:
@@ -128,7 +130,7 @@ def _set_approval_status(approval_id: str, status: str, *,
         conn.commit()
 
 
-def _write_outbox(message: str) -> None:
+def _write_outbox(message: str, *, reply_markup: dict | None = None) -> None:
     chat_id = _tg_chat_id()
     if not chat_id:
         logger.warning("TELEGRAM_CHAT_ID not set; skipping outbox write")
@@ -136,12 +138,24 @@ def _write_outbox(message: str) -> None:
     try:
         with psycopg.connect(_db_url()) as conn:
             conn.execute(
-                "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
-                (chat_id, message),
+                """INSERT INTO outbox (channel, recipient, message, reply_markup)
+                   VALUES ('telegram', %s, %s, %s)""",
+                (chat_id, message, Jsonb(reply_markup) if reply_markup else None),
             )
             conn.commit()
     except Exception:
         logger.exception("outbox write failed")
+
+
+def _parse_files_changed(diff_text: str) -> list[str]:
+    return re.findall(r"^diff --git a/(.+?) b/", diff_text or "", re.MULTILINE)
+
+
+def _repo_to_https(repo_url: str) -> str:
+    m = re.match(r"git@github\.com:(.+?)(?:\.git)?$", repo_url or "")
+    if m:
+        return f"https://github.com/{m.group(1)}"
+    return (repo_url or "").removesuffix(".git")
 
 
 # ---------------------------------------------------------------------------
@@ -385,11 +399,27 @@ async def _build_one(approval: dict) -> None:
         return
 
     _set_approval_status(approval_id, "awaiting_review", diff_text=diff_text, branch=branch_name)
-    _write_outbox(
-        f"Build ready for review — `{short_id}`\n"
-        f"branch: `{branch_name}`\n"
-        f"task: {task[:200]}"
+
+    files = _parse_files_changed(diff_text)
+    listed = files[:8]
+    overflow = len(files) - len(listed)
+    files_lines = "\n".join(f"  • `{f}`" for f in listed)
+    if overflow:
+        files_lines += f"\n  _+{overflow} more_"
+    gh_url = _repo_to_https(project["repo_url"])
+    branch_link = f"[{branch_name}]({gh_url}/tree/{branch_name})"
+    notification = (
+        f"🔨 *Build ready* — `{short_id}`\n"
+        f"*task:* {task[:200]}\n"
+        f"*branch:* {branch_link}\n"
+        f"*changed:* {len(files)} file{'s' if len(files) != 1 else ''}\n"
+        f"{files_lines}"
     )
+    keyboard = {"inline_keyboard": [[
+        {"text": "✅ Promote", "callback_data": f"promote:{approval_id}"},
+        {"text": "❌ Kill",    "callback_data": f"kill:{approval_id}"},
+    ]]}
+    _write_outbox(notification, reply_markup=keyboard)
     logger.info("build complete", extra={"ctx": {
         "approval_id": approval_id, "branch": branch_name,
     }})
