@@ -18,7 +18,7 @@ TG_BASE = f"https://api.telegram.org/bot{TOKEN}"
 
 
 async def get_updates(offset=None):
-    params = {"timeout": 30, "allowed_updates": ["message"]}
+    params = {"timeout": 30, "allowed_updates": ["message", "callback_query"]}
     if offset:
         params["offset"] = offset
     async with httpx.AsyncClient(timeout=35) as client:
@@ -30,6 +30,19 @@ async def send_message(chat_id: int, text: str):
     async with httpx.AsyncClient() as client:
         await client.post(f"{TG_BASE}/sendMessage",
                           json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+
+
+async def answer_callback(callback_query_id: str, text: str = "") -> None:
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(f"{TG_BASE}/answerCallbackQuery",
+                          json={"callback_query_id": callback_query_id, "text": text})
+
+
+async def edit_message_reply_markup(chat_id: int, message_id: int) -> None:
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(f"{TG_BASE}/editMessageReplyMarkup",
+                          json={"chat_id": chat_id, "message_id": message_id,
+                                "reply_markup": {"inline_keyboard": [[]]}})
 
 
 async def capture_to_brain(
@@ -46,6 +59,50 @@ async def capture_to_brain(
         return r.json()
 
 
+async def handle_callback(cb: dict) -> None:
+    cb_id = cb["id"]
+    data = cb.get("data", "")
+    msg = cb.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+
+    parts = data.split(":", 1)
+    if len(parts) != 2 or parts[0] not in ("promote", "kill"):
+        await answer_callback(cb_id, "Unknown action")
+        return
+
+    action, approval_id = parts[0], parts[1]
+    endpoint = f"{BRAIN_API}/build/{approval_id}/{action}"
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(endpoint, headers=BRAIN_HEADERS)
+
+        if r.status_code == 409:
+            await answer_callback(cb_id, f"Already {r.text.strip()}")
+            return
+
+        r.raise_for_status()
+        result = r.json()
+
+        if action == "promote":
+            toast = "PR created ✅"
+            follow_up = f"PR opened: {result['pr_url']}"
+        else:
+            toast = "Branch killed ❌"
+            follow_up = None
+
+        await answer_callback(cb_id, toast)
+        if chat_id and message_id:
+            await edit_message_reply_markup(chat_id, message_id)
+        if follow_up and chat_id:
+            await send_message(chat_id, follow_up)
+
+    except Exception as e:
+        print(f"[bot] callback error ({action} {approval_id[:8]}): {e}")
+        await answer_callback(cb_id, f"Error: {str(e)[:100]}")
+
+
 async def main():
     print(f"Brain Telegram bot started. Listening for chat_id: {ALLOWED_CHAT_ID}")
     offset = None
@@ -54,6 +111,16 @@ async def main():
             updates = await get_updates(offset)
             for update in updates:
                 offset = update["update_id"] + 1
+
+                cb = update.get("callback_query")
+                if cb:
+                    cb_chat_id = cb.get("message", {}).get("chat", {}).get("id")
+                    if cb_chat_id != ALLOWED_CHAT_ID:
+                        await answer_callback(cb["id"], "")
+                        continue
+                    await handle_callback(cb)
+                    continue
+
                 msg = update.get("message", {})
                 chat_id = msg.get("chat", {}).get("id")
 
