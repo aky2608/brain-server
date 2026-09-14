@@ -35,7 +35,7 @@ logger.propagate = False
 
 WORKER_ID = f"builder-{uuid.uuid4().hex[:8]}"
 AIDER_PATH = "/home/ashish/.local/bin/aider"
-AIDER_MODEL = "gemini/gemini-2.5-flash"
+AIDER_MODEL = "gemini/gemini-3.6-flash"
 AIDER_TIMEOUT = 600.0  # 10 minutes hard kill
 POLL_INTERVAL = 5
 LOG_BASE = pathlib.Path("/opt/brain/logs/builds")
@@ -102,6 +102,15 @@ def _get_project(project_id: str) -> dict:
     return {"local_path": row[0], "default_branch": row[1]}
 
 
+def _get_next_attempt(approval_id: str) -> int:
+    with psycopg.connect(_db_url()) as conn:
+        row = conn.execute(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM step_executions WHERE approval_id = %s",
+            (approval_id,),
+        ).fetchone()
+    return row[0]
+
+
 def _set_approval_status(approval_id: str, status: str, *,
                           diff_text: str | None = None,
                           branch: str | None = None) -> None:
@@ -142,6 +151,7 @@ def _write_outbox(message: str) -> None:
 async def _run_step(
     approval_id: str,
     step_no: int,
+    attempt: int,
     cmd: list[str],
     log_path: pathlib.Path,
     cwd: str,
@@ -152,14 +162,14 @@ async def _run_step(
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command_str = " ".join(cmd)
     logger.info("step start", extra={"ctx": {
-        "approval_id": approval_id, "step_no": step_no, "cmd": command_str,
+        "approval_id": approval_id, "attempt": attempt, "step_no": step_no, "cmd": command_str,
     }})
 
     with psycopg.connect(_db_url()) as conn:
         step_id = str(conn.execute(
-            """INSERT INTO step_executions (approval_id, step_no, command, stdout_ref, started_at)
-               VALUES (%s, %s, %s, %s, now()) RETURNING id""",
-            (approval_id, step_no, command_str, str(log_path)),
+            """INSERT INTO step_executions (approval_id, attempt, step_no, command, stdout_ref, started_at)
+               VALUES (%s, %s, %s, %s, %s, now()) RETURNING id""",
+            (approval_id, attempt, step_no, command_str, str(log_path)),
         ).fetchone()[0])
         conn.commit()
 
@@ -206,25 +216,35 @@ async def _run_step(
 # ---------------------------------------------------------------------------
 
 async def _probe_aider_model() -> None:
-    """Fail loud at startup if the Aider model string doesn't resolve."""
+    """Fail loud at startup if the model doesn't produce real work.
+
+    Aider exits 0 even on LLM errors (e.g. 404). So we verify it actually
+    created a file and committed — not just that the process exited cleanly.
+    """
     with tempfile.TemporaryDirectory() as tmp:
-        init = await asyncio.create_subprocess_exec(
-            "git", "init", tmp,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await init.wait()
+        tmp_path = pathlib.Path(tmp)
+
+        for git_cmd in (
+            ["git", "init", tmp],
+            ["git", "-C", tmp, "config", "user.email", "probe@brain"],
+            ["git", "-C", tmp, "config", "user.name", "probe"],
+        ):
+            p = await asyncio.create_subprocess_exec(
+                *git_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await p.wait()
 
         proc = await asyncio.create_subprocess_exec(
-            AIDER_PATH, "--model", AIDER_MODEL,
-            "--message", "reply OK",
-            "--yes",
+            AIDER_PATH, "--model", AIDER_MODEL, "--yes",
+            "--message", "Create a file named probe.txt containing the single line: PROBE_OK",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=tmp,
         )
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
@@ -232,11 +252,33 @@ async def _probe_aider_model() -> None:
                 pass
             raise RuntimeError(f"Aider model probe timed out — {AIDER_MODEL}")
 
-    if proc.returncode != 0:
-        tail = stdout.decode(errors="replace")[-600:]
-        raise RuntimeError(
-            f"Aider model probe failed (exit {proc.returncode}) for {AIDER_MODEL}:\n{tail}"
+        tail = stdout.decode(errors="replace")
+
+        failures = []
+        if proc.returncode != 0:
+            failures.append(f"exit code {proc.returncode}")
+
+        probe_file = tmp_path / "probe.txt"
+        if not probe_file.exists():
+            failures.append("probe.txt not created")
+        elif "PROBE_OK" not in probe_file.read_text():
+            failures.append("probe.txt missing PROBE_OK")
+
+        log_proc = await asyncio.create_subprocess_exec(
+            "git", "-C", tmp, "log", "--oneline",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
         )
+        log_out, _ = await log_proc.communicate()
+        if not log_out.strip():
+            failures.append("aider made no git commit")
+
+        if failures:
+            raise RuntimeError(
+                f"Aider model probe failed ({'; '.join(failures)}) for {AIDER_MODEL}:\n"
+                f"{tail[-600:]}"
+            )
+
     logger.info("aider model probe ok", extra={"ctx": {"model": AIDER_MODEL}})
 
 
@@ -267,6 +309,7 @@ async def _build_one(approval: dict) -> None:
     local_path = project["local_path"]
     default_branch = project["default_branch"]
 
+    attempt = _get_next_attempt(approval_id)
     log_dir = LOG_BASE / approval_id
     step_no = 0
 
@@ -274,8 +317,9 @@ async def _build_one(approval: dict) -> None:
         nonlocal step_no
         step_no += 1
         return await _run_step(
-            approval_id, step_no, cmd, log_dir / f"step{step_no}.log", local_path,
-            timeout=timeout,
+            approval_id, step_no, attempt, cmd,
+            log_dir / f"step{step_no}-attempt{attempt}.log",
+            local_path, timeout=timeout,
         )
 
     # Step 1: fetch
@@ -317,11 +361,18 @@ async def _build_one(approval: dict) -> None:
         _write_outbox(f"Build FAILED (git diff) — `{short_id}`")
         return
 
+    if not diff_bytes.strip():
+        _set_approval_status(approval_id, "failed")
+        _write_outbox(
+            f"Build FAILED (aider produced no changes) — `{short_id}`\ntask: {task[:200]}"
+        )
+        return
+
     diff_text = diff_bytes.decode(errors="replace")
     if len(diff_bytes) > DIFF_MAX_BYTES:
         diff_text = (
             diff_text[:DIFF_MAX_BYTES]
-            + f"\n\n[truncated — full diff at {log_dir}/step{step_no}.log]"
+            + f"\n\n[truncated — full diff at {log_dir}/step{step_no}-attempt{attempt}.log]"
         )
 
     # Step 5: push
@@ -371,15 +422,19 @@ async def builder_worker() -> None:
             logger.info("approval claimed", extra={"ctx": {"approval_id": approval["id"]}})
             try:
                 await _build_one(approval)
-            except Exception:
+            except Exception as exc:
                 tb = traceback.format_exc()
                 logger.error("build crashed", extra={"ctx": {
-                    "approval_id": approval["id"], "error": tb[:500],
+                    "approval_id": approval["id"],
+                    "exc_type": type(exc).__name__,
+                    "exc_msg": str(exc)[:200],
+                    "traceback": tb[:2000],
                 }})
                 try:
                     _set_approval_status(approval["id"], "failed")
                     _write_outbox(
-                        f"Build CRASHED — `{approval['id'][:8]}`\n{tb[:300]}"
+                        f"Build CRASHED — `{approval['id'][:8]}`\n"
+                        f"{type(exc).__name__}: {str(exc)[:200]}"
                     )
                 except Exception:
                     pass
