@@ -53,7 +53,8 @@
       "Read(//var/www/finance/**)",
       "Bash(venv/bin/alembic current *)",
       "Bash(/opt/brain/venv/bin/python *)",
-      "Bash(systemctl is-active *)"
+      "Bash(systemctl is-active *)",
+      "Bash(git commit *)"
     ]
   }
 }

@@ -8,3 +8,4 @@ dummy.m4a
 .env*
 *.bak.*
 .env*
+logs/
