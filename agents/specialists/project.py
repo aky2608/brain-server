@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import ClassVar, Optional
 
 import psycopg
+from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowModel
@@ -48,12 +49,14 @@ class ProjectAgent(BaseAgent):
         task_text = parts[1].strip() if len(parts) > 1 else ""
 
         if not alias:
+            _write_outbox(f"Build rejected: no alias provided\nraw: {raw[:200]}")
             return ProjectOutput(
                 item_id=input.item_id,
                 accepted=False,
                 reason="no project alias provided",
             )
         if not task_text:
+            _write_outbox(f"Build rejected: no task text for alias '{alias}'")
             return ProjectOutput(
                 item_id=input.item_id,
                 accepted=False,
@@ -62,18 +65,30 @@ class ProjectAgent(BaseAgent):
 
         project = _lookup_project(alias)
         if project is None:
+            _write_outbox(
+                f"Build rejected: unknown project alias '{alias}'\n"
+                f"task: {task_text[:200]}"
+            )
             return ProjectOutput(
                 item_id=input.item_id,
                 accepted=False,
                 reason=f"unknown project alias '{alias}'",
             )
         if project["status"] != "active":
+            _write_outbox(
+                f"Build rejected: project '{alias}' is {project['status']}\n"
+                f"task: {task_text[:200]}"
+            )
             return ProjectOutput(
                 item_id=input.item_id,
                 accepted=False,
                 reason=f"project '{alias}' is {project['status']}",
             )
         if not project["build_enabled"]:
+            _write_outbox(
+                f"Build rejected: build not enabled for '{alias}'\n"
+                f"task: {task_text[:200]}"
+            )
             return ProjectOutput(
                 item_id=input.item_id,
                 accepted=False,
@@ -89,8 +104,23 @@ class ProjectAgent(BaseAgent):
             "requested_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        approval_id = _write_approval(project["id"], spec)
+        try:
+            approval_id = _write_approval(project["id"], spec)
+        except UniqueViolation:
+            _write_outbox(
+                f"Build rejected: a build for this task is already in flight\n"
+                f"task: {task_text[:200]}"
+            )
+            return ProjectOutput(
+                item_id=input.item_id,
+                accepted=False,
+                reason="a build for this task is already in flight",
+            )
         if approval_id is None:
+            _write_outbox(
+                f"Build rejected: database error\n"
+                f"task: {task_text[:200]}"
+            )
             return ProjectOutput(
                 item_id=input.item_id,
                 accepted=False,
@@ -116,6 +146,26 @@ class ProjectAgent(BaseAgent):
 
 def _db_url() -> str:
     return os.environ.get("BRAIN_DB_URL", "")
+
+
+def _tg_chat_id() -> str:
+    return os.environ.get("TELEGRAM_CHAT_ID", "")
+
+
+def _write_outbox(message: str) -> None:
+    chat_id = _tg_chat_id()
+    url = _db_url()
+    if not chat_id or not url:
+        return
+    try:
+        with psycopg.connect(url) as conn:
+            conn.execute(
+                "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
+                (chat_id, message),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("project_agent: outbox write failed")
 
 
 def _lookup_project(alias: str) -> Optional[dict]:
@@ -161,6 +211,8 @@ def _write_approval(project_id: str, spec: dict) -> Optional[str]:
             ).fetchone()
             conn.commit()
             return str(row[0]) if row else None
+    except UniqueViolation:
+        raise
     except Exception:
         logger.error("project_agent: approval insert failed", exc_info=True)
         return None
