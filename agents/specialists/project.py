@@ -95,9 +95,22 @@ class ProjectAgent(BaseAgent):
                 reason=f"build not enabled for project '{alias}'",
             )
 
+        engine = "aider" if re.search(r"(?:^|\s)--aider(?:\s|$)", task_text, re.IGNORECASE) else "claude"
+        task_text = re.sub(r"\s*--aider\b", "", task_text, flags=re.IGNORECASE)
+        task_text = re.sub(r"\s+", " ", task_text).strip()
+
+        if not task_text:
+            _write_outbox(f"Build rejected: no task text for alias '{alias}'")
+            return ProjectOutput(
+                item_id=input.item_id,
+                accepted=False,
+                reason="no task text provided",
+            )
+
         spec = {
             "alias": alias,
             "task": task_text,
+            "engine": engine,
             "repo_url": project["repo_url"],
             "local_path": project["local_path"],
             "default_branch": project["default_branch"],
@@ -105,7 +118,7 @@ class ProjectAgent(BaseAgent):
         }
 
         try:
-            approval_id = _write_approval(project["id"], spec)
+            approval_id = _write_approval(project["id"], spec, engine)
         except UniqueViolation:
             _write_outbox(
                 f"Build rejected: a build for this task is already in flight\n"
@@ -196,7 +209,7 @@ def _lookup_project(alias: str) -> Optional[dict]:
         return None
 
 
-def _write_approval(project_id: str, spec: dict) -> Optional[str]:
+def _write_approval(project_id: str, spec: dict, engine: str) -> Optional[str]:
     url = _db_url()
     if not url:
         return None
@@ -204,10 +217,10 @@ def _write_approval(project_id: str, spec: dict) -> Optional[str]:
         with psycopg.connect(url) as conn:
             row = conn.execute(
                 """INSERT INTO pending_approvals
-                       (project_id, spec, status, expires_at)
-                   VALUES (%s, %s, 'pending', now() + interval '24 hours')
+                       (project_id, spec, status, engine, expires_at)
+                   VALUES (%s, %s, 'pending', %s, now() + interval '24 hours')
                    RETURNING id""",
-                (project_id, Jsonb(spec)),
+                (project_id, Jsonb(spec), engine),
             ).fetchone()
             conn.commit()
             return str(row[0]) if row else None
