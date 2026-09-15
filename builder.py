@@ -39,6 +39,10 @@ WORKER_ID = f"builder-{uuid.uuid4().hex[:8]}"
 AIDER_PATH = "/home/ashish/.local/bin/aider"
 AIDER_MODEL = "gemini/gemini-3.6-flash"
 AIDER_TIMEOUT = 600.0  # 10 minutes hard kill
+# Stable symlink; survives Node version upgrades via nvm.
+# If this breaks after a Node upgrade, run: ln -sf $(which claude) ~/.local/bin/claude
+CLAUDE_PATH = "/home/ashish/.local/bin/claude"
+CLAUDE_TIMEOUT = 600.0
 POLL_INTERVAL = 5
 LOG_BASE = pathlib.Path("/opt/brain/logs/builds")
 DIFF_MAX_BYTES = 100_000  # ~100 KB; truncated with marker, full diff stays on disk
@@ -85,13 +89,13 @@ def _claim_next_approval() -> dict | None:
                    LIMIT 1
                    FOR UPDATE SKIP LOCKED
                )
-               RETURNING id, project_id, spec""",
+               RETURNING id, project_id, spec, engine""",
             (WORKER_ID,),
         ).fetchone()
         conn.commit()
     if row is None:
         return None
-    return {"id": str(row[0]), "project_id": str(row[1]), "spec": row[2]}
+    return {"id": str(row[0]), "project_id": str(row[1]), "spec": row[2], "engine": row[3]}
 
 
 def _get_project(project_id: str) -> dict:
@@ -172,6 +176,7 @@ async def _run_step(
     cwd: str,
     *,
     timeout: float | None = None,
+    env: dict | None = None,
 ) -> tuple[int, bytes]:
     """Run cmd, log stdout+stderr to log_path, record a step_executions row."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,6 +201,7 @@ async def _run_step(
             stderr=asyncio.subprocess.STDOUT,
             cwd=cwd,
             start_new_session=True,
+            env=env,
         )
         try:
             if timeout is not None:
@@ -297,17 +303,94 @@ async def _probe_aider_model() -> None:
     logger.info("aider model probe ok", extra={"ctx": {"model": AIDER_MODEL}})
 
 
-def _probe_cache_valid() -> bool:
+def _probe_cache_valid(engine: str) -> bool:
     try:
         data = json.loads(PROBE_CACHE.read_text())
-        return data.get("model") == AIDER_MODEL and time.time() - data["ts"] < 86400
+        entry = data.get(engine, {})
+        model_key = AIDER_MODEL if engine == "aider" else CLAUDE_PATH
+        return entry.get("model") == model_key and time.time() - entry["ts"] < 86400
     except Exception:
         return False
 
 
-def _save_probe_cache() -> None:
+def _save_probe_cache(engine: str) -> None:
     PROBE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    PROBE_CACHE.write_text(json.dumps({"model": AIDER_MODEL, "ts": time.time()}))
+    try:
+        data = json.loads(PROBE_CACHE.read_text())
+    except Exception:
+        data = {}
+    model_key = AIDER_MODEL if engine == "aider" else CLAUDE_PATH
+    data[engine] = {"model": model_key, "ts": time.time()}
+    PROBE_CACHE.write_text(json.dumps(data))
+
+
+async def _probe_claude_code() -> None:
+    """Verify Claude Code can edit files in a scratch repo.
+
+    Unlike Aider, Claude Code does not auto-commit — we only check that the
+    file was created, not that a commit was made.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+
+        for git_cmd in (
+            ["git", "init", tmp],
+            ["git", "-C", tmp, "config", "user.email", "probe@brain"],
+            ["git", "-C", tmp, "config", "user.name", "probe"],
+        ):
+            p = await asyncio.create_subprocess_exec(
+                *git_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await p.wait()
+
+        env = {**os.environ, "HOME": "/home/ashish"}
+        proc = await asyncio.create_subprocess_exec(
+            CLAUDE_PATH, "-p",
+            "Create a file named probe.txt containing the single line: PROBE_OK",
+            "--permission-mode", "acceptEdits",
+            "--allowedTools", "Edit Write Read",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=tmp,
+            env=env,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=120)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            raise RuntimeError("Claude Code probe timed out")
+
+        tail = stdout.decode(errors="replace")
+        failures = []
+        if proc.returncode != 0:
+            failures.append(f"exit code {proc.returncode}")
+        probe_file = tmp_path / "probe.txt"
+        if not probe_file.exists():
+            failures.append("probe.txt not created")
+        elif "PROBE_OK" not in probe_file.read_text():
+            failures.append("probe.txt missing PROBE_OK")
+        if failures:
+            raise RuntimeError(
+                f"Claude Code probe failed ({'; '.join(failures)}):\n{tail[-600:]}"
+            )
+
+    logger.info("claude code probe ok", extra={"ctx": {"path": CLAUDE_PATH}})
+
+
+def _has_pending_aider_builds() -> bool:
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM pending_approvals WHERE status='pending' AND engine='aider' LIMIT 1"
+            ).fetchone()
+        return row is not None
+    except Exception:
+        return True  # fail safe: probe anyway
 
 
 def _cleanup_old_build_logs() -> int:
@@ -332,6 +415,7 @@ async def _build_one(approval: dict) -> None:
     short_id = approval_id.replace("-", "")[:8]
     branch_name = f"agent/{short_id}"
     task = approval["spec"].get("task", "")
+    engine = approval["engine"]  # column value, set at approval creation
 
     project = _get_project(approval["project_id"])
     local_path = project["local_path"]
@@ -341,13 +425,15 @@ async def _build_one(approval: dict) -> None:
     log_dir = LOG_BASE / approval_id
     step_no = 0
 
-    async def run(cmd: list[str], *, timeout: float | None = None) -> tuple[int, bytes]:
+    async def run(
+        cmd: list[str], *, timeout: float | None = None, env: dict | None = None
+    ) -> tuple[int, bytes]:
         nonlocal step_no
         step_no += 1
         return await _run_step(
             approval_id, step_no, attempt, cmd,
             log_dir / f"step{step_no}-attempt{attempt}.log",
-            local_path, timeout=timeout,
+            local_path, timeout=timeout, env=env,
         )
 
     # Step 1: fetch
@@ -367,20 +453,68 @@ async def _build_one(approval: dict) -> None:
         _write_outbox(f"Build FAILED (git checkout) — `{short_id}`")
         return
 
-    # Step 3: aider
-    code, _ = await run(
-        [AIDER_PATH, "--yes", "--model", AIDER_MODEL, "--message", task],
-        timeout=AIDER_TIMEOUT,
-    )
-    if code != 0:
-        _set_approval_status(approval_id, "failed")
-        _write_outbox(
-            f"Build FAILED (aider exit {code}) — `{short_id}`\n"
-            f"task: {task[:200]}"
+    # Step 3: LLM edits  (Claude: no git access; Aider: auto-commits)
+    # NOTE: the Aider path has not been run end-to-end since the engine split.
+    if engine == "claude":
+        env = {**os.environ, "HOME": "/home/ashish"}
+        code, _ = await run(
+            [CLAUDE_PATH, "-p", task,
+             "--permission-mode", "acceptEdits",
+             "--allowedTools", "Edit Write Read"],
+            timeout=CLAUDE_TIMEOUT,
+            env=env,
         )
-        return
+        if code != 0:
+            _set_approval_status(approval_id, "failed")
+            _write_outbox(
+                f"Build FAILED (claude exit {code}) — `{short_id}`\n"
+                f"task: {task[:200]}"
+            )
+            return
 
-    # Step 4: diff — read output for diff_text
+        # Stage everything; check for actual changes before committing
+        add_proc = await asyncio.create_subprocess_exec(
+            "git", "-C", local_path, "add", "-A",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await add_proc.wait()
+
+        check_proc = await asyncio.create_subprocess_exec(
+            "git", "-C", local_path, "diff", "--cached", "--quiet",
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await check_proc.wait()
+        if check_proc.returncode == 0:  # 0 = nothing staged
+            _set_approval_status(approval_id, "failed")
+            _write_outbox(
+                f"Build FAILED (claude produced no changes) — `{short_id}`\n"
+                f"task: {task[:200]}"
+            )
+            return
+
+        # Step 4: commit
+        code, _ = await run(
+            ["git", "-C", local_path, "commit", "-m", f"agent: {task[:72]}"],
+        )
+        if code != 0:
+            _set_approval_status(approval_id, "failed")
+            _write_outbox(f"Build FAILED (git commit) — `{short_id}`")
+            return
+
+    else:  # aider — NOTE: untested since engine split; treat as best-effort path
+        code, _ = await run(
+            [AIDER_PATH, "--yes", "--model", AIDER_MODEL, "--message", task],
+            timeout=AIDER_TIMEOUT,
+        )
+        if code != 0:
+            _set_approval_status(approval_id, "failed")
+            _write_outbox(
+                f"Build FAILED (aider exit {code}) — `{short_id}`\n"
+                f"task: {task[:200]}"
+            )
+            return
+
+    # Step 4/5: diff (step number continues from wherever we are)
     code, diff_bytes = await run([
         "git", "-C", local_path, "diff", f"origin/{default_branch}...HEAD",
     ])
@@ -392,7 +526,8 @@ async def _build_one(approval: dict) -> None:
     if not diff_bytes.strip():
         _set_approval_status(approval_id, "failed")
         _write_outbox(
-            f"Build FAILED (aider produced no changes) — `{short_id}`\ntask: {task[:200]}"
+            f"Build FAILED ({engine} produced no changes) — `{short_id}`\n"
+            f"task: {task[:200]}"
         )
         return
 
@@ -403,7 +538,7 @@ async def _build_one(approval: dict) -> None:
             + f"\n\n[truncated — full diff at {log_dir}/step{step_no}-attempt{attempt}.log]"
         )
 
-    # Step 5: push
+    # Step 5/6: push
     code, _ = await run([
         "git", "-C", local_path, "push", "--force-with-lease", "origin", branch_name,
     ])
@@ -423,7 +558,7 @@ async def _build_one(approval: dict) -> None:
     gh_url = _repo_to_https(project["repo_url"])
     branch_link = f"[{branch_name}]({gh_url}/tree/{branch_name})"
     notification = (
-        f"🔨 *Build ready* — `{short_id}`\n"
+        f"🔨 *Build ready* — `{short_id}` [{engine}]\n"
         f"*task:* {task[:200]}\n"
         f"*branch:* {branch_link}\n"
         f"*changed:* {len(files)} file{'s' if len(files) != 1 else ''}\n"
@@ -435,7 +570,7 @@ async def _build_one(approval: dict) -> None:
     ]]}
     _write_outbox(notification, reply_markup=keyboard)
     logger.info("build complete", extra={"ctx": {
-        "approval_id": approval_id, "branch": branch_name,
+        "approval_id": approval_id, "branch": branch_name, "engine": engine,
     }})
 
 
@@ -446,11 +581,22 @@ async def _build_one(approval: dict) -> None:
 async def builder_worker() -> None:
     import traceback
 
-    if _probe_cache_valid():
-        logger.info("aider probe skipped (cached)", extra={"ctx": {"model": AIDER_MODEL}})
+    # Claude probe always runs (subscription, no quota cost)
+    if _probe_cache_valid("claude"):
+        logger.info("claude probe skipped (cached)", extra={"ctx": {"path": CLAUDE_PATH}})
     else:
-        await _probe_aider_model()
-        _save_probe_cache()
+        await _probe_claude_code()
+        _save_probe_cache("claude")
+
+    # Aider probe only when aider builds are actually queued (Gemini quota: 20/day)
+    if _has_pending_aider_builds():
+        if _probe_cache_valid("aider"):
+            logger.info("aider probe skipped (cached)", extra={"ctx": {"model": AIDER_MODEL}})
+        else:
+            await _probe_aider_model()
+            _save_probe_cache("aider")
+    else:
+        logger.info("aider probe skipped (no queued aider builds)")
 
     recovered = _recover_stale_locks()
     if recovered:
