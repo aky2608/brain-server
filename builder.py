@@ -42,6 +42,7 @@ AIDER_TIMEOUT = 600.0  # 10 minutes hard kill
 POLL_INTERVAL = 5
 LOG_BASE = pathlib.Path("/opt/brain/logs/builds")
 DIFF_MAX_BYTES = 100_000  # ~100 KB; truncated with marker, full diff stays on disk
+PROBE_CACHE = pathlib.Path("/opt/brain/logs/builder_probe_cache.json")
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +297,19 @@ async def _probe_aider_model() -> None:
     logger.info("aider model probe ok", extra={"ctx": {"model": AIDER_MODEL}})
 
 
+def _probe_cache_valid() -> bool:
+    try:
+        data = json.loads(PROBE_CACHE.read_text())
+        return data.get("model") == AIDER_MODEL and time.time() - data["ts"] < 86400
+    except Exception:
+        return False
+
+
+def _save_probe_cache() -> None:
+    PROBE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    PROBE_CACHE.write_text(json.dumps({"model": AIDER_MODEL, "ts": time.time()}))
+
+
 def _cleanup_old_build_logs() -> int:
     """Remove build log dirs older than 30 days. Same pattern as backup rotation."""
     if not LOG_BASE.exists():
@@ -432,7 +446,11 @@ async def _build_one(approval: dict) -> None:
 async def builder_worker() -> None:
     import traceback
 
-    await _probe_aider_model()
+    if _probe_cache_valid():
+        logger.info("aider probe skipped (cached)", extra={"ctx": {"model": AIDER_MODEL}})
+    else:
+        await _probe_aider_model()
+        _save_probe_cache()
 
     recovered = _recover_stale_locks()
     if recovered:
