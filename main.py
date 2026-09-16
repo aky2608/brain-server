@@ -12,7 +12,7 @@ import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -916,6 +916,84 @@ async def get_planner(bucket: Optional[str] = None):
         query = query.is_("plan_bucket", "null").eq("action_class", "task").eq("status", "active")
     result = query.order("plan_order").order("created_at", desc=True).execute()
     return {"items": result.data}
+
+
+@app.get("/agent/today", dependencies=[Depends(verify_api_key)])
+async def get_agent_today():
+    IST = timezone(timedelta(hours=5, minutes=30))
+    today_start = (
+        datetime.now(IST)
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .isoformat()
+    )
+
+    r_tasks = (
+        supabase.table("items").select("id", count="exact")
+        .eq("plan_bucket", "today").eq("action_class", "task").eq("status", "active")
+        .execute()
+    )
+    r_done = (
+        supabase.table("items").select("id", count="exact")
+        .eq("plan_bucket", "today").eq("action_class", "task")
+        .eq("status", "active").eq("task_status", "done")
+        .execute()
+    )
+    r_captures = (
+        supabase.table("items").select("id", count="exact")
+        .gte("created_at", today_start)
+        .execute()
+    )
+
+    r_brief = (
+        supabase.table("agent_decisions").select("*")
+        .eq("interrupt_tier", "morning_brief")
+        .gte("created_at", today_start)
+        .order("created_at", desc=True).limit(1)
+        .execute()
+    )
+
+    r_interrupts = (
+        supabase.table("agent_decisions").select("*")
+        .eq("interrupt_tier", "always")
+        .is_("dismissed_at", "null")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    r_timeline = (
+        supabase.table("items").select("*")
+        .eq("plan_bucket", "today").eq("action_class", "task").eq("status", "active")
+        .order("plan_order").order("created_at", desc=True)
+        .execute()
+    )
+
+    return {
+        "status": {
+            "tasks_today":      r_tasks.count or 0,
+            "tasks_done_today": r_done.count or 0,
+            "captures_today":   r_captures.count or 0,
+        },
+        "brief":      r_brief.data[0] if r_brief.data else None,
+        "interrupts": r_interrupts.data,
+        "timeline":   r_timeline.data,
+        "calendar":   [],
+    }
+
+
+@app.post("/agent/interrupts/{decision_id}/dismiss", dependencies=[Depends(verify_api_key)])
+async def dismiss_interrupt(decision_id: int):
+    with psycopg.connect(_db_url()) as conn:
+        cur = conn.execute(
+            """UPDATE agent_decisions
+               SET dismissed_at = now()
+             WHERE id = %s AND dismissed_at IS NULL""",
+            (decision_id,),
+        )
+        conn.commit()
+        claimed = cur.rowcount == 1
+    if not claimed:
+        raise HTTPException(409, "already dismissed")
+    return {"ok": True}
 
 
 class MovePlannerInput(BaseModel):
