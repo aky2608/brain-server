@@ -983,6 +983,112 @@ async def get_agent_today():
     }
 
 
+@app.get("/dashboard/summary", dependencies=[Depends(verify_api_key)])
+async def get_dashboard_summary():
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(IST)
+    today_start = now_ist.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    week_start = (now_ist - timedelta(days=now_ist.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    # today tile
+    r_today_total = (
+        supabase.table("items").select("id", count="exact")
+        .eq("plan_bucket", "today").eq("action_class", "task").eq("status", "active")
+        .execute()
+    )
+    r_today_done = (
+        supabase.table("items").select("id", count="exact")
+        .eq("plan_bucket", "today").eq("action_class", "task")
+        .eq("status", "active").eq("task_status", "done")
+        .execute()
+    )
+    # neq silently drops NULLs in PostgREST — use or_ to include null/pending/in_progress
+    r_next_up = (
+        supabase.table("items")
+        .select("id,title,ai_summary,plan_order,task_status")
+        .eq("plan_bucket", "today").eq("action_class", "task").eq("status", "active")
+        .or_("task_status.is.null,task_status.eq.pending,task_status.eq.in_progress")
+        .order("plan_order").limit(1)
+        .execute()
+    )
+
+    # capture tile
+    r_capture_today = (
+        supabase.table("items").select("id", count="exact")
+        .gte("created_at", today_start)
+        .execute()
+    )
+    r_capture_week = (
+        supabase.table("items").select("id", count="exact")
+        .gte("created_at", week_start)
+        .execute()
+    )
+    with psycopg.connect(_db_url()) as conn:
+        cat_rows = conn.execute(
+            "SELECT category, COUNT(*) FROM items WHERE created_at >= %s GROUP BY category",
+            (week_start,),
+        ).fetchall()
+    by_category = {(r[0] or "uncategorized"): r[1] for r in cat_rows}
+
+    # interrupts tile — same query as /agent/today
+    r_interrupts = (
+        supabase.table("agent_decisions")
+        .select("id,agent_name,item_id,action_taken,reason,interrupt_tier,created_at")
+        .eq("interrupt_tier", "always")
+        .is_("dismissed_at", "null")
+        .order("created_at", desc=True)
+        .execute()
+    )
+
+    # builds tile — failed_24h uses IST midnight so all "today" boundaries align
+    r_awaiting = (
+        supabase.table("pending_approvals").select("id", count="exact")
+        .eq("status", "awaiting_review")
+        .execute()
+    )
+    r_running = (
+        supabase.table("pending_approvals").select("id", count="exact")
+        .eq("status", "running")
+        .execute()
+    )
+    r_failed = (
+        supabase.table("pending_approvals").select("id", count="exact")
+        .eq("status", "failed").gte("created_at", today_start)
+        .execute()
+    )
+    r_latest = (
+        supabase.table("pending_approvals")
+        .select("id,status,engine,created_at,resolved_at,branch")
+        .order("created_at", desc=True).limit(1)
+        .execute()
+    )
+
+    return {
+        "today": {
+            "tasks":   r_today_total.count or 0,
+            "done":    r_today_done.count or 0,
+            "next_up": r_next_up.data[0] if r_next_up.data else None,
+        },
+        "capture": {
+            "today":       r_capture_today.count or 0,
+            "week":        r_capture_week.count or 0,
+            "by_category": by_category,
+        },
+        "interrupts": r_interrupts.data,
+        "builds": {
+            "awaiting_review": r_awaiting.count or 0,
+            "running":         r_running.count or 0,
+            "failed_24h":      r_failed.count or 0,
+            "latest":          r_latest.data[0] if r_latest.data else None,
+        },
+        "gate":     None,
+        "revision": None,
+        "finance":  None,
+        "people":   None,
+        "system":   None,
+    }
+
+
 @app.post("/agent/interrupts/{decision_id}/dismiss", dependencies=[Depends(verify_api_key)])
 async def dismiss_interrupt(decision_id: int):
     with psycopg.connect(_db_url()) as conn:
