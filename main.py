@@ -961,7 +961,8 @@ async def get_agent_today():
     )
 
     r_timeline = (
-        supabase.table("items").select("*")
+        supabase.table("items")
+        .select("id, raw_content, title, ai_summary, category, task_status, task_progress, task_deadline, plan_order, rollover_note")
         .eq("plan_bucket", "today").eq("action_class", "task").eq("status", "active")
         .order("plan_order").order("created_at", desc=True)
         .execute()
