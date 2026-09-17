@@ -874,12 +874,13 @@ async def update_item(item_id: str, updates: dict):
 
 @app.get("/tasks", dependencies=[Depends(verify_api_key)])
 async def get_tasks(status: Optional[str] = None):
-    query = supabase.table("items").select("*").eq("action_class", "task")
+    _TASK_COLS = "id,created_at,updated_at,source,capture_type,category,subcategory,action_class,raw_content,ai_summary,ai_tags,location_lat,location_lng,location_name,metadata,status,task_status,task_deadline,task_progress,plan_bucket,plan_order,plan_date,mood_score,energy_score,reviewed,streak_data,classification_status,corrected_category,corrected_at,capture_uuid,embedding_model,rollover_note,title,notebook_id"
+    query = supabase.table("items").select(_TASK_COLS).eq("action_class", "task")
     if status:
         if status == "pending":
             # include rows where task_status is null OR pending
             result_null = query.is_("task_status", "null").order("created_at", desc=True).execute()
-            result_pend = supabase.table("items").select("*").eq("action_class", "task")\
+            result_pend = supabase.table("items").select(_TASK_COLS).eq("action_class", "task")\
                 .eq("task_status", "pending").order("created_at", desc=True).execute()
             tasks = result_null.data + result_pend.data
             tasks.sort(key=lambda x: x.get("created_at", ""), reverse=True)
@@ -909,7 +910,8 @@ async def get_planner_counts():
 
 @app.get("/planner", dependencies=[Depends(verify_api_key)])
 async def get_planner(bucket: Optional[str] = None):
-    query = supabase.table("items").select("*")
+    _PLANNER_COLS = "id,raw_content,title,ai_summary,category,subcategory,action_class,task_status,task_progress,task_deadline,plan_order,rollover_note,plan_bucket,plan_date,status,created_at"
+    query = supabase.table("items").select(_PLANNER_COLS)
     if bucket:
         query = query.eq("plan_bucket", bucket)
     else:
