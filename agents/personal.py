@@ -2,6 +2,7 @@ import logging
 import os
 import re
 from typing import Optional
+from uuid import UUID
 
 import psycopg
 from dotenv import load_dotenv
@@ -93,6 +94,18 @@ def _log_decision(
         logger.exception("agent_decisions write failed")
 
 
+def _real_uuid(val: Optional[str]) -> Optional[str]:
+    """Return val only if it parses as a UUID, else None.
+    Guards against synthetic IDs like 'watch-cron' violating the items FK."""
+    if not val:
+        return None
+    try:
+        UUID(val)
+        return val
+    except ValueError:
+        return None
+
+
 def _log_route(
     destination: str,
     action_taken: str,
@@ -140,6 +153,8 @@ def personal_agent_node(state: GraphState) -> dict:
 
         Every routing decision is written to agent_decisions before returning.
     """
+    item_id = _real_uuid(state.get("capture_uuid"))
+
     if state.get("specialist_result") is not None:
         result = state["specialist_result"] or {}
         # Relay any decisions a specialist surfaced — sole-writer invariant: only
@@ -150,11 +165,13 @@ def personal_agent_node(state: GraphState) -> dict:
                 action_taken=d.get("action_taken", ""),
                 reason=d.get("reason", ""),
                 interrupt_tier=d.get("interrupt_tier", "log_only"),
-                item_id=d.get("item_id"),
+                item_id=d.get("item_id") or item_id,
             )
         # Chain to finance_agent when capture_agent classifies a life/finance item.
         # finance_agent's output has no subcategory key, so this fires exactly once.
         if result.get("subcategory") == "finance" and result.get("item_id"):
+            _log_route("finance_agent", "route_chain:finance",
+                       "capture_agent classified life/finance; chaining", item_id=item_id)
             return {"routed_to": "finance_agent", "specialist_result": None}
         return {"routed_to": None}
 
@@ -174,7 +191,7 @@ def personal_agent_node(state: GraphState) -> dict:
                 )
                 if conflict:
                     _log_route("people_agent", f"resolve_conflict:{answer}:{code}",
-                               "conflict reply with explicit code")
+                               "conflict reply with explicit code", item_id=item_id)
                     return {
                         "routed_to": "people_agent", "specialist_result": None,
                         "people_action": "resolve_conflict",
@@ -186,7 +203,7 @@ def personal_agent_node(state: GraphState) -> dict:
                 return {"routed_to": None, "specialist_result": {"handled": "conflict_code_unknown"}}
             elif len(pending) == 1:
                 _log_route("people_agent", f"resolve_conflict:{answer}:implicit",
-                           "single open conflict, no code needed")
+                           "single open conflict, no code needed", item_id=item_id)
                 return {
                     "routed_to": "people_agent", "specialist_result": None,
                     "people_action": "resolve_conflict",
@@ -204,7 +221,8 @@ def personal_agent_node(state: GraphState) -> dict:
 
     # 1. why/explain hard fork — no LLM; reads agent_decisions
     if lower.startswith("why") or lower.startswith("explain"):
-        _log_route("why_agent", "route_why", "why/explain prefix — reading stored agent_decisions")
+        _log_route("why_agent", "route_why", "why/explain prefix — reading stored agent_decisions",
+                   item_id=item_id)
         return {"routed_to": "why"}
 
     # 2. Slash command: /alias [rest of text]
@@ -214,14 +232,15 @@ def personal_agent_node(state: GraphState) -> dict:
     if alias == "people":
         subcommand = raw.strip()[len("/people"):].strip().lower()
         if subcommand == "pending":
-            _log_route("people_agent", "route_slash:people:pending", "/people pending")
+            _log_route("people_agent", "route_slash:people:pending", "/people pending",
+                       item_id=item_id)
             return {
                 "routed_to": "people_agent", "specialist_result": None,
                 "people_action": "list_pending",
                 "conflict_id": None, "conflict_answer": None,
             }
         _log_route("echo_agent", f"route_slash_unknown:people:{subcommand}",
-                   f"/people {subcommand!r} not a known subcommand")
+                   f"/people {subcommand!r} not a known subcommand", item_id=item_id)
         return {"routed_to": "echo"}
 
     if alias is not None:
@@ -233,6 +252,7 @@ def personal_agent_node(state: GraphState) -> dict:
                     DISPATCH_MAP[routing_key],
                     f"route_slash:{alias}",
                     f"/{alias} → capture_shortcuts → routing_key={routing_key!r}",
+                    item_id=item_id,
                 )
                 return {"routed_to": routing_key}
         # alias not in capture_shortcuts or agent not in DISPATCH_MAP → fall through to echo
@@ -240,6 +260,7 @@ def personal_agent_node(state: GraphState) -> dict:
             "echo_agent",
             f"route_slash_unknown:{alias}",
             f"/{alias} not in capture_shortcuts or no wired agent, defaulting to echo",
+            item_id=item_id,
         )
         return {"routed_to": "echo"}
 
@@ -251,12 +272,14 @@ def personal_agent_node(state: GraphState) -> dict:
                 DISPATCH_MAP[category],
                 f"route_category:{category}",
                 f"classified category {category!r} in DISPATCH_MAP",
+                item_id=item_id,
             )
             return {"routed_to": category}
         _log_route(
             "capture_agent",
             f"route_category_unhandled:{category}",
             f"category {category!r} has no specialist wired yet, classify via capture_agent",
+            item_id=item_id,
         )
         return {"routed_to": "capture_agent"}
 
@@ -265,6 +288,7 @@ def personal_agent_node(state: GraphState) -> dict:
         "capture_agent",
         "route_fallback",
         "no slash/why/category match; routing to capture_agent for classify+embed",
+        item_id=item_id,
     )
     return {"routed_to": "capture_agent"}
 

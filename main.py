@@ -1236,6 +1236,81 @@ async def get_agents_status():
     }
 
 
+@app.get("/agents/recent-trails", dependencies=[Depends(verify_api_key)])
+async def get_recent_trails():
+    with psycopg.connect(_db_url()) as conn:
+        agg_rows = conn.execute(
+            """SELECT item_id, MAX(created_at) AS last_decision_at, COUNT(*) AS decision_count
+               FROM agent_decisions
+               WHERE item_id IS NOT NULL
+               GROUP BY item_id
+               ORDER BY last_decision_at DESC
+               LIMIT 10"""
+        ).fetchall()
+        if not agg_rows:
+            return {"trails": []}
+        ids = [str(r[0]) for r in agg_rows]
+        item_rows = conn.execute(
+            """SELECT id, raw_content, category, action_class
+               FROM items WHERE id = ANY(%s)""",
+            (ids,),
+        ).fetchall()
+    item_map = {str(r[0]): {"raw_content": r[1], "category": r[2], "action_class": r[3]}
+                for r in item_rows}
+    trails = []
+    for item_id, last_decision_at, decision_count in agg_rows:
+        sid = str(item_id)
+        item = item_map.get(sid, {})
+        trails.append({
+            "item_id":          sid,
+            "raw_content":      item.get("raw_content"),
+            "category":         item.get("category"),
+            "action_class":     item.get("action_class"),
+            "last_decision_at": last_decision_at.isoformat() if last_decision_at else None,
+            "decision_count":   decision_count,
+        })
+    return {"trails": trails}
+
+
+@app.get("/items/{item_id}/trail", dependencies=[Depends(verify_api_key)])
+async def get_item_trail(item_id: str):
+    with psycopg.connect(_db_url()) as conn:
+        item_row = conn.execute(
+            """SELECT id, raw_content, category, action_class, task_status, plan_bucket, created_at
+               FROM items WHERE id = %s""",
+            (item_id,),
+        ).fetchone()
+        if not item_row:
+            raise HTTPException(404, "Item not found")
+        decision_rows = conn.execute(
+            """SELECT agent_name, action_taken, reason, interrupt_tier, created_at
+               FROM agent_decisions
+               WHERE item_id = %s
+               ORDER BY created_at ASC""",
+            (item_id,),
+        ).fetchall()
+    item = {
+        "id":           str(item_row[0]),
+        "raw_content":  item_row[1],
+        "category":     item_row[2],
+        "action_class": item_row[3],
+        "task_status":  item_row[4],
+        "plan_bucket":  item_row[5],
+        "created_at":   item_row[6].isoformat() if item_row[6] else None,
+    }
+    decisions = [
+        {
+            "agent_name":    r[0],
+            "action_taken":  r[1],
+            "reason":        r[2],
+            "interrupt_tier": r[3],
+            "created_at":    r[4].isoformat() if r[4] else None,
+        }
+        for r in decision_rows
+    ]
+    return {"item": item, "decisions": decisions}
+
+
 @app.post("/agent/interrupts/{decision_id}/dismiss", dependencies=[Depends(verify_api_key)])
 async def dismiss_interrupt(decision_id: int):
     with psycopg.connect(_db_url()) as conn:
