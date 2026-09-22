@@ -71,12 +71,29 @@ supabase: Client = create_client(
     os.getenv("SUPABASE_SERVICE_KEY"),
 )
 
-ACTIVE_SOURCES = {"app_voice", "app_text", "app_share", "app_photo", "web_upload", "telegram"}
+ACTIVE_SOURCES = {"app_voice", "app_text", "app_share", "app_photo", "web_upload", "web_console", "telegram"}
 # Claude models are not supported for UNIFY_CHAT_WITH_AI on this 1min.ai account/plan —
 # confirmed via direct API testing. Both models below are verified working.
 # ⚠ gpt-4.1-nano deprecationDate: 2026-10-21 — replace fallback before that date.
 ONEMIN_MODEL = "gpt-4o-mini"
 FALLBACK_MODEL = "gpt-4.1-nano"
+
+# Agent registry — trigger types and intervals are facts about the running system, not inferred.
+# loop: runs on a fixed async interval. reactive: fires on capture/route. manual: slash alias only.
+# interval_hours is only set for loop agents and drives the health check window (interval × 2).
+_AGENT_REGISTRY = [
+    {"name": "watch_agent",      "trigger": "loop",     "interval_hours": 1,    "detail": "hourly eval loop; also /watch alias"},
+    {"name": "capture_agent",    "trigger": "reactive", "interval_hours": None, "detail": "fires on POST /capture; batch sweep every 2 min"},
+    {"name": "scheduling_agent", "trigger": "manual",   "interval_hours": None, "detail": "/plan alias — never runs on a schedule"},
+    {"name": "finance_agent",    "trigger": "reactive", "interval_hours": None, "detail": "routed by personal agent on capture"},
+    {"name": "why_agent",        "trigger": "reactive", "interval_hours": None, "detail": "routed by personal agent — no slash alias"},
+    {"name": "notebook_agent",   "trigger": "manual",   "interval_hours": None, "detail": "/gate alias"},
+    {"name": "revision_agent",   "trigger": "manual",   "interval_hours": None, "detail": "/revise and /drill aliases"},
+    {"name": "people_agent",     "trigger": "reactive", "interval_hours": None, "detail": "gated extraction on capture"},
+    {"name": "project_agent",    "trigger": "manual",   "interval_hours": None, "detail": "/build alias"},
+    {"name": "echo_agent",       "trigger": "manual",   "interval_hours": None, "detail": "test/debug — /echo alias"},
+    {"name": "personal_agent",   "trigger": "reactive", "interval_hours": None, "detail": "entry point for all captures — routes to specialists"},
+]
 
 _WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
 
@@ -1012,6 +1029,13 @@ async def get_dashboard_summary():
         .execute()
     )
 
+    r_today_unplanned = (
+        supabase.table("items").select("id", count="exact")
+        .is_("plan_bucket", "null")
+        .eq("action_class", "task").eq("status", "active")
+        .execute()
+    )
+
     # capture tile
     r_capture_today = (
         supabase.table("items").select("id", count="exact")
@@ -1021,6 +1045,10 @@ async def get_dashboard_summary():
     r_capture_week = (
         supabase.table("items").select("id", count="exact")
         .gte("created_at", week_start)
+        .execute()
+    )
+    r_capture_total = (
+        supabase.table("items").select("id", count="exact")
         .execute()
     )
     with psycopg.connect(_db_url()) as conn:
@@ -1065,13 +1093,15 @@ async def get_dashboard_summary():
 
     return {
         "today": {
-            "tasks":   r_today_total.count or 0,
-            "done":    r_today_done.count or 0,
-            "next_up": r_next_up.data[0] if r_next_up.data else None,
+            "tasks":     r_today_total.count or 0,
+            "done":      r_today_done.count or 0,
+            "unplanned": r_today_unplanned.count or 0,
+            "next_up":   r_next_up.data[0] if r_next_up.data else None,
         },
         "capture": {
             "today":       r_capture_today.count or 0,
             "week":        r_capture_week.count or 0,
+            "total":       r_capture_total.count or 0,
             "by_category": by_category,
         },
         "interrupts": r_interrupts.data,
@@ -1086,6 +1116,123 @@ async def get_dashboard_summary():
         "finance":  None,
         "people":   None,
         "system":   None,
+    }
+
+
+def _summarise_condition(rule_type: str, condition: dict) -> str:
+    """Render a watch-rule condition JSONB as a plain-English string."""
+    if rule_type == "gate_missed":
+        warn = condition.get("threshold_warn")
+        esc  = condition.get("threshold_escalate")
+        days = condition.get("window_days")
+        parts = []
+        if warn is not None:
+            parts.append(f"warn at {warn} missed")
+        if esc is not None:
+            parts.append(f"escalate at {esc} missed")
+        if days is not None:
+            parts.append(f"in {days}-day window")
+        return ", ".join(parts) if parts else str(condition)
+    if rule_type == "reminder_snoozed":
+        threshold = condition.get("snooze_threshold")
+        days = condition.get("window_days")
+        parts = []
+        if threshold is not None:
+            parts.append(f"trigger after {threshold} snoozes")
+        if days is not None:
+            parts.append(f"in {days} days")
+        return ", ".join(parts) if parts else str(condition)
+    if rule_type == "interview_prep":
+        days_out = condition.get("days_before")
+        return f"fire {days_out} days before interview" if days_out is not None else str(condition)
+    if rule_type == "scheduling_conflict":
+        return condition.get("description", str(condition))
+    return str(condition)
+
+
+@app.get("/agents/status", dependencies=[Depends(verify_api_key)])
+async def get_agents_status():
+    now = datetime.now(timezone.utc)
+
+    with psycopg.connect(_db_url()) as conn:
+        # unbounded last_run per agent
+        last_run_rows = conn.execute(
+            "SELECT agent_name, MAX(created_at) FROM agent_decisions GROUP BY agent_name"
+        ).fetchall()
+        last_run_map = {r[0]: r[1] for r in last_run_rows}
+
+        # 7-day decision counts per agent
+        count_rows = conn.execute(
+            "SELECT agent_name, COUNT(*) FROM agent_decisions"
+            " WHERE created_at >= NOW() - INTERVAL '7 days' GROUP BY agent_name"
+        ).fetchall()
+        count_map = {r[0]: r[1] for r in count_rows}
+
+        # job_queue counts by status
+        jq_rows = conn.execute(
+            "SELECT status, COUNT(*) FROM job_queue GROUP BY status"
+        ).fetchall()
+
+        # pending_approvals counts by status
+        pa_rows = conn.execute(
+            "SELECT status, COUNT(*) FROM pending_approvals GROUP BY status"
+        ).fetchall()
+
+        # watch rules
+        wr_rows = conn.execute(
+            "SELECT id, rule_type, enabled, condition, cooldown_hours, last_notified_at"
+            " FROM agent_watch_rules ORDER BY id"
+        ).fetchall()
+
+    agents = []
+    for entry in _AGENT_REGISTRY:
+        name = entry["name"]
+        last_run = last_run_map.get(name)
+        decisions_7d = count_map.get(name, 0)
+
+        rec: dict = {
+            "name":           name,
+            "trigger":        entry["trigger"],
+            "trigger_detail": entry["detail"],
+            "last_run":       last_run.isoformat() if last_run else None,
+            "decisions_7d":   decisions_7d,
+        }
+
+        if entry["trigger"] == "loop":
+            window = timedelta(hours=entry["interval_hours"] * 2)
+            if last_run is None:
+                rec["health"] = "never"
+            elif (now - last_run) <= window:
+                rec["health"] = "ok"
+            else:
+                rec["health"] = "stale"
+
+        agents.append(rec)
+
+    watch_rules = []
+    for row in wr_rows:
+        rid, rule_type, enabled, condition, cooldown_hours, last_notified_at = row
+        in_cooldown = (
+            last_notified_at is not None
+            and (now - last_notified_at) < timedelta(hours=cooldown_hours)
+        )
+        watch_rules.append({
+            "id":                rid,
+            "rule_type":         rule_type,
+            "enabled":           enabled,
+            "condition_summary": _summarise_condition(rule_type, condition or {}),
+            "cooldown_hours":    cooldown_hours,
+            "last_notified_at":  last_notified_at.isoformat() if last_notified_at else None,
+            "in_cooldown":       in_cooldown,
+        })
+
+    return {
+        "agents":      agents,
+        "watch_rules": watch_rules,
+        "queue": {
+            "job_queue":          {r[0]: r[1] for r in jq_rows},
+            "pending_approvals":  {r[0]: r[1] for r in pa_rows},
+        },
     }
 
 
@@ -1763,6 +1910,83 @@ async def get_item_graph(item_id: str):
         "edges":      edges,
         "node_count": len(nodes),
         "edge_count": len(edges),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Build list / detail
+# ---------------------------------------------------------------------------
+
+
+@app.get("/builds", dependencies=[Depends(verify_api_key)])
+async def list_builds(limit: int = 50):
+    with psycopg.connect(_db_url()) as conn:
+        rows = conn.execute(
+            """SELECT id, status, engine, branch, spec, created_at, resolved_at,
+                      length(diff_text) AS diff_size
+               FROM pending_approvals
+               ORDER BY created_at DESC
+               LIMIT %s""",
+            (min(limit, 200),),
+        ).fetchall()
+    return {
+        "builds": [
+            {
+                "id": str(r[0]),
+                "status": r[1],
+                "engine": r[2],
+                "branch": r[3],
+                "spec": r[4],
+                "created_at": r[5].isoformat() if r[5] else None,
+                "resolved_at": r[6].isoformat() if r[6] else None,
+                "diff_size": r[7],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.get("/builds/{approval_id}", dependencies=[Depends(verify_api_key)])
+async def get_build(approval_id: str):
+    with psycopg.connect(_db_url()) as conn:
+        row = conn.execute(
+            """SELECT id, status, engine, branch, spec, created_at, resolved_at,
+                      diff_text, length(diff_text) AS diff_size
+               FROM pending_approvals WHERE id = %s""",
+            (approval_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "not found")
+        steps = conn.execute(
+            """SELECT step_no, attempt, command, exit_code, started_at, finished_at
+               FROM step_executions
+               WHERE approval_id = %s
+               ORDER BY step_no, attempt""",
+            (approval_id,),
+        ).fetchall()
+    return {
+        "build": {
+            "id": str(row[0]),
+            "status": row[1],
+            "engine": row[2],
+            "branch": row[3],
+            "spec": row[4],
+            "created_at": row[5].isoformat() if row[5] else None,
+            "resolved_at": row[6].isoformat() if row[6] else None,
+            "diff_text": row[7],
+            "diff_size": row[8],
+        },
+        "steps": [
+            {
+                "step_no": s[0],
+                "attempt": s[1],
+                "command": s[2],
+                "exit_code": s[3],
+                "started_at": s[4].isoformat() if s[4] else None,
+                "finished_at": s[5].isoformat() if s[5] else None,
+            }
+            for s in steps
+        ],
     }
 
 

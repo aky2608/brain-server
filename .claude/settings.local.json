@@ -54,7 +54,16 @@
       "Bash(venv/bin/alembic current *)",
       "Bash(/opt/brain/venv/bin/python *)",
       "Bash(systemctl is-active *)",
-      "Bash(git commit *)"
+      "Bash(git commit *)",
+      "Bash(systemctl cat *)",
+      "Bash(curl -s -H \"X-API-Key: 975c6eb4d8ea42dd5ac3a1776c387cedc4b4ce23ad94dbaad0107ff9443ae6a4\" \"http://localhost:8100/tasks\")",
+      "Bash(curl -s -H \"X-API-Key: 975c6eb4d8ea42dd5ac3a1776c387cedc4b4ce23ad94dbaad0107ff9443ae6a4\" \"http://localhost:8100/tasks?status=pending\")",
+      "Bash(curl -s -H \"X-API-Key: 975c6eb4d8ea42dd5ac3a1776c387cedc4b4ce23ad94dbaad0107ff9443ae6a4\" \"http://localhost:8100/planner\")",
+      "Bash(curl -s -H \"X-API-Key: 975c6eb4d8ea42dd5ac3a1776c387cedc4b4ce23ad94dbaad0107ff9443ae6a4\" \"http://localhost:8100/planner?bucket=today\")",
+      "Read(//etc/nginx/sites-enabled/**)",
+      "Read(//etc/nginx/conf.d/**)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -H \"X-API-Key: 975c6eb4d8ea42dd5ac3a1776c387cedc4b4ce23ad94dbaad0107ff9443ae6a4\" http://localhost:8100/builds)",
+      "Bash(xargs -I {} basename {} .py)"
     ]
   }
 }

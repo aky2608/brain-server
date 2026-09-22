@@ -93,6 +93,36 @@ def _log_decision(
         logger.exception("agent_decisions write failed")
 
 
+def _log_route(
+    destination: str,
+    action_taken: str,
+    reason: str,
+    item_id: Optional[str] = None,
+) -> None:
+    """Write two rows atomically: personal_agent routing row + destination agent row.
+    Use for every routing decision so personal_agent is visible in agent_decisions."""
+    url = _db_url()
+    if not url:
+        return
+    try:
+        with psycopg.connect(url) as conn:
+            conn.execute(
+                """INSERT INTO agent_decisions
+                       (agent_name, item_id, action_taken, reason, interrupt_tier)
+                   VALUES (%s, %s, %s, %s, 'log_only')""",
+                ("personal_agent", item_id, f"route_to:{destination}", reason),
+            )
+            conn.execute(
+                """INSERT INTO agent_decisions
+                       (agent_name, item_id, action_taken, reason, interrupt_tier)
+                   VALUES (%s, %s, %s, %s, 'log_only')""",
+                (destination, item_id, action_taken, reason),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("agent_decisions write failed")
+
+
 def personal_agent_node(state: GraphState) -> dict:
     """
     Sole entry point. Two modes:
@@ -143,8 +173,8 @@ def personal_agent_node(state: GraphState) -> dict:
                     (c for c in pending if str(c["id"]).replace("-", "")[-6:] == code), None
                 )
                 if conflict:
-                    _log_decision("people_agent", f"resolve_conflict:{answer}:{code}",
-                                  "conflict reply with explicit code")
+                    _log_route("people_agent", f"resolve_conflict:{answer}:{code}",
+                               "conflict reply with explicit code")
                     return {
                         "routed_to": "people_agent", "specialist_result": None,
                         "people_action": "resolve_conflict",
@@ -155,8 +185,8 @@ def personal_agent_node(state: GraphState) -> dict:
                                      f"Code {code} not found. Open: {known}")
                 return {"routed_to": None, "specialist_result": {"handled": "conflict_code_unknown"}}
             elif len(pending) == 1:
-                _log_decision("people_agent", f"resolve_conflict:{answer}:implicit",
-                              "single open conflict, no code needed")
+                _log_route("people_agent", f"resolve_conflict:{answer}:implicit",
+                           "single open conflict, no code needed")
                 return {
                     "routed_to": "people_agent", "specialist_result": None,
                     "people_action": "resolve_conflict",
@@ -174,11 +204,7 @@ def personal_agent_node(state: GraphState) -> dict:
 
     # 1. why/explain hard fork — no LLM; reads agent_decisions
     if lower.startswith("why") or lower.startswith("explain"):
-        _log_decision(
-            agent_name="why_agent",
-            action_taken="route_why",
-            reason="why/explain prefix — reading stored agent_decisions",
-        )
+        _log_route("why_agent", "route_why", "why/explain prefix — reading stored agent_decisions")
         return {"routed_to": "why"}
 
     # 2. Slash command: /alias [rest of text]
@@ -188,14 +214,14 @@ def personal_agent_node(state: GraphState) -> dict:
     if alias == "people":
         subcommand = raw.strip()[len("/people"):].strip().lower()
         if subcommand == "pending":
-            _log_decision("people_agent", "route_slash:people:pending", "/people pending")
+            _log_route("people_agent", "route_slash:people:pending", "/people pending")
             return {
                 "routed_to": "people_agent", "specialist_result": None,
                 "people_action": "list_pending",
                 "conflict_id": None, "conflict_answer": None,
             }
-        _log_decision("echo_agent", f"route_slash_unknown:people:{subcommand}",
-                      f"/people {subcommand!r} not a known subcommand")
+        _log_route("echo_agent", f"route_slash_unknown:people:{subcommand}",
+                   f"/people {subcommand!r} not a known subcommand")
         return {"routed_to": "echo"}
 
     if alias is not None:
@@ -203,17 +229,17 @@ def personal_agent_node(state: GraphState) -> dict:
         if shortcut:
             routing_key = shortcut["agent"] or "echo"
             if routing_key in DISPATCH_MAP:
-                _log_decision(
-                    agent_name=DISPATCH_MAP[routing_key],
-                    action_taken=f"route_slash:{alias}",
-                    reason=f"/{alias} → capture_shortcuts → routing_key={routing_key!r}",
+                _log_route(
+                    DISPATCH_MAP[routing_key],
+                    f"route_slash:{alias}",
+                    f"/{alias} → capture_shortcuts → routing_key={routing_key!r}",
                 )
                 return {"routed_to": routing_key}
         # alias not in capture_shortcuts or agent not in DISPATCH_MAP → fall through to echo
-        _log_decision(
-            agent_name="echo_agent",
-            action_taken=f"route_slash_unknown:{alias}",
-            reason=f"/{alias} not in capture_shortcuts or no wired agent, defaulting to echo",
+        _log_route(
+            "echo_agent",
+            f"route_slash_unknown:{alias}",
+            f"/{alias} not in capture_shortcuts or no wired agent, defaulting to echo",
         )
         return {"routed_to": "echo"}
 
@@ -221,24 +247,24 @@ def personal_agent_node(state: GraphState) -> dict:
     category = state.get("routed_to")
     if category:
         if category in DISPATCH_MAP:
-            _log_decision(
-                agent_name=DISPATCH_MAP[category],
-                action_taken=f"route_category:{category}",
-                reason=f"classified category {category!r} in DISPATCH_MAP",
+            _log_route(
+                DISPATCH_MAP[category],
+                f"route_category:{category}",
+                f"classified category {category!r} in DISPATCH_MAP",
             )
             return {"routed_to": category}
-        _log_decision(
-            agent_name="capture_agent",
-            action_taken=f"route_category_unhandled:{category}",
-            reason=f"category {category!r} has no specialist wired yet, classify via capture_agent",
+        _log_route(
+            "capture_agent",
+            f"route_category_unhandled:{category}",
+            f"category {category!r} has no specialist wired yet, classify via capture_agent",
         )
         return {"routed_to": "capture_agent"}
 
     # 4. Fallback — capture_agent is the default classify path for all non-slash non-why input
-    _log_decision(
-        agent_name="capture_agent",
-        action_taken="route_fallback",
-        reason="no slash/why/category match; routing to capture_agent for classify+embed",
+    _log_route(
+        "capture_agent",
+        "route_fallback",
+        "no slash/why/category match; routing to capture_agent for classify+embed",
     )
     return {"routed_to": "capture_agent"}
 
