@@ -37,7 +37,7 @@ SHADOW_MODE = False
 
 _EXTRACT_SUBCATEGORIES   = frozenset({"finance", "quotes", "wayclear", "accrediq"})
 # 'finance' included because the LLM sometimes outputs category=finance instead of life/finance
-_EXTRACT_NULL_CATEGORIES = frozenset({"thoughts", "life", "finance"})
+_EXTRACT_NULL_CATEGORIES = frozenset({"thoughts", "life", "finance", "work"})
 
 
 def _should_extract_people(category: Optional[str], subcategory: Optional[str]) -> bool:
@@ -116,6 +116,7 @@ class CaptureOutput(NarrowModel):
     shadow: bool
     embedding_stored: bool = False
     links_created: int = 0  # wikilink + embedding links combined
+    decisions: list[dict] = []
 
 
 class CaptureAgent(BaseAgent):
@@ -142,6 +143,16 @@ class CaptureAgent(BaseAgent):
 
         cls = _classify(input.raw, input.source, input.capture_type)
         vector = _embed(input.raw)
+        decisions: list[dict] = []
+
+        cat = cls.get("category", "thoughts")
+        sub = cls.get("subcategory")
+        decisions.append({
+            "agent_name": "capture_agent",
+            "action_taken": f"classified:{cat}/{sub}" if sub else f"classified:{cat}",
+            "reason": cls.get("summary", ""),
+            "interrupt_tier": "log_only",
+        })
 
         if SHADOW_MODE:
             logger.info(
@@ -156,17 +167,19 @@ class CaptureAgent(BaseAgent):
             )
             return CaptureOutput(
                 item_id=input.capture_uuid,
-                category=cls.get("category", "thoughts"),
-                subcategory=cls.get("subcategory"),
+                category=cat,
+                subcategory=sub,
                 tags=cls.get("tags", []),
                 summary=cls.get("summary", ""),
                 action_class=cls.get("action_class", "record"),
                 shadow=True,
+                decisions=decisions,
             )
 
         # Non-shadow: one connection, one commit for all writes
         embedding_stored = False
-        links_created = 0
+        wikilink_count = 0
+        embedding_link_count = 0
         url = os.environ.get("BRAIN_DB_URL", "")
         if url:
             try:
@@ -175,19 +188,42 @@ class CaptureAgent(BaseAgent):
                     if vector:
                         _store_embedding(input.capture_uuid, vector, conn)
                         embedding_stored = True
-                    links_created += _link_wikilinks(input.capture_uuid, input.raw, conn)
+                    wikilink_count = _link_wikilinks(input.capture_uuid, input.raw, conn)
                     if vector:
-                        links_created += _link_embeddings(input.capture_uuid, vector, conn)
+                        embedding_link_count = _link_embeddings(input.capture_uuid, vector, conn)
                     conn.commit()
+
+                decisions.append({
+                    "agent_name": "capture_agent",
+                    "action_taken": "embedded" if embedding_stored else "embed:skipped",
+                    "reason": f"model={_EMBED_MODEL}" if embedding_stored else "no vector returned",
+                    "interrupt_tier": "log_only",
+                })
+                decisions.append({
+                    "agent_name": "capture_agent",
+                    "action_taken": f"linked:wikilink={wikilink_count},embedding={embedding_link_count}",
+                    "reason": f"{wikilink_count} wikilink(s), {embedding_link_count} embedding link(s) created",
+                    "interrupt_tier": "log_only",
+                })
+
+                people_enqueued = False
                 if _should_extract_people(cls.get("category"), cls.get("subcategory")):
                     try:
                         _enqueue_people_extraction(input.capture_uuid, input.raw, input.source)
+                        people_enqueued = True
                     except Exception:
                         logger.warning(
                             "people_extraction enqueue failed",
                             extra={"ctx": {"item_id": input.capture_uuid}},
                             exc_info=True,
                         )
+                decisions.append({
+                    "agent_name": "capture_agent",
+                    "action_taken": "people:enqueued" if people_enqueued else "people:skipped",
+                    "reason": f"category={cat} sub={sub}" if not people_enqueued else "queued for name extraction",
+                    "interrupt_tier": "log_only",
+                })
+
                 try:
                     _record_project_activity_capture(
                         input.capture_uuid,
@@ -210,14 +246,15 @@ class CaptureAgent(BaseAgent):
 
         return CaptureOutput(
             item_id=input.capture_uuid,
-            category=cls.get("category", "thoughts"),
-            subcategory=cls.get("subcategory"),
+            category=cat,
+            subcategory=sub,
             tags=cls.get("tags", []),
             summary=cls.get("summary", ""),
             action_class=cls.get("action_class", "record"),
             shadow=False,
             embedding_stored=embedding_stored,
-            links_created=links_created,
+            links_created=wikilink_count + embedding_link_count,
+            decisions=decisions,
         )
 
 

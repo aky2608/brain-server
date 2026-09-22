@@ -257,10 +257,30 @@ class PeopleAgent(BaseAgent):
 # Extraction job — called from job_queue worker via run_in_executor
 # ---------------------------------------------------------------------------
 
+def _write_extraction_decision(item_id: str, action_taken: str, reason: str) -> None:
+    # Deliberate exception to the sole-writer rule: run_people_extraction runs as a
+    # job_queue job with no graph path, so there is no personal_agent merge step to relay through.
+    url = os.environ.get("BRAIN_DB_URL", "")
+    if not url:
+        return
+    try:
+        with psycopg.connect(url) as conn:
+            conn.execute(
+                """INSERT INTO agent_decisions
+                       (agent_name, item_id, action_taken, reason, interrupt_tier)
+                   VALUES ('people_agent', %s, %s, %s, 'log_only')""",
+                (item_id, action_taken, reason),
+            )
+            conn.commit()
+    except Exception:
+        logger.warning("people_extraction: decision write failed", exc_info=True)
+
+
 def run_people_extraction(item_id: str, raw_content: str, source: str) -> None:
     names = _extract_names(raw_content)
     if not names:
         logger.info("people_extraction: no names found", extra={"ctx": {"item_id": item_id}})
+        _write_extraction_decision(item_id, "extracted:0", "no names found in content")
         return
 
     url = os.environ.get("BRAIN_DB_URL", "")
@@ -276,6 +296,7 @@ def run_people_extraction(item_id: str, raw_content: str, source: str) -> None:
             seen[key] = entry
     names = list(seen.values())
 
+    outcomes: list[str] = []
     try:
         with psycopg.connect(url) as conn:
             row = conn.execute(
@@ -288,11 +309,13 @@ def run_people_extraction(item_id: str, raw_content: str, source: str) -> None:
                 # If either INSERT fails, sp_name rollback undoes both — no orphan people rows.
                 conn.execute("SAVEPOINT sp_name")
                 try:
-                    _process_name(conn, item_id, entry["name"], entry["context"], chat_id)
+                    outcome = _process_name(conn, item_id, entry["name"], entry["context"], chat_id)
+                    outcomes.append(f"{entry['name']}:{outcome}")
                     conn.execute("RELEASE SAVEPOINT sp_name")
                 except Exception:
                     conn.execute("ROLLBACK TO SAVEPOINT sp_name")
                     conn.execute("RELEASE SAVEPOINT sp_name")
+                    outcomes.append(f"{entry['name']}:error")
                     logger.error(
                         "people_extraction: skipping name %r",
                         entry["name"],
@@ -306,6 +329,12 @@ def run_people_extraction(item_id: str, raw_content: str, source: str) -> None:
             extra={"ctx": {"item_id": item_id}},
             exc_info=True,
         )
+
+    _write_extraction_decision(
+        item_id,
+        f"extracted:{len(outcomes)}",
+        "; ".join(outcomes) if outcomes else "write phase failed",
+    )
 
 
 def _extract_names(raw_content: str) -> list[dict]:
@@ -346,7 +375,7 @@ def _process_name(
     name: str,
     context: str,
     source: str,
-) -> None:
+) -> str:
     rows = conn.execute(
         """SELECT id, name, created_at, similarity(name_normalized, lower(%s)) AS sim
            FROM people
@@ -367,6 +396,7 @@ def _process_name(
             (best_id,),
         )
         logger.info("people: auto-linked", extra={"ctx": {"name": name, "person_id": best_id}})
+        return "linked"
 
     elif rows and rows[0][3] >= _LOW_SIM:
         best_id       = str(rows[0][0])
@@ -415,6 +445,7 @@ def _process_name(
             "people: conflict",
             extra={"ctx": {"name": name, "candidate": candidate_name, "asked": conflict_id is not None}},
         )
+        return "conflict_asked" if conflict_id else "conflict_duplicate"
 
     else:
         new_id = str(conn.execute(
@@ -428,6 +459,7 @@ def _process_name(
             (item_id, new_id, name),
         )
         logger.info("people: new provisional", extra={"ctx": {"name": name, "person_id": new_id}})
+        return "new_provisional"
 
 
 # ---------------------------------------------------------------------------

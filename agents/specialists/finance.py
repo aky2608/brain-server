@@ -80,13 +80,20 @@ class FinanceAgent(BaseAgent):
 
     def handle(self, input: FinanceInput) -> FinanceOutput:
         extracted = _extract(input.raw)
+        decisions: list[dict] = []
 
         if not extracted or not extracted.get("is_transaction"):
             logger.info(
                 "finance_agent: non-transaction capture, skipping ledger write",
                 extra={"ctx": {"item_id": input.item_id}},
             )
-            return FinanceOutput(item_id=input.item_id, extraction_success=False)
+            decisions.append({
+                "agent_name": "finance_agent",
+                "action_taken": "rejected:non-transaction",
+                "reason": "LLM classified as finance-adjacent, not a real transaction",
+                "interrupt_tier": "log_only",
+            })
+            return FinanceOutput(item_id=input.item_id, extraction_success=False, decisions=decisions)
 
         amount_raw = extracted.get("amount")
         if amount_raw is None:
@@ -94,7 +101,13 @@ class FinanceAgent(BaseAgent):
                 "finance_agent: is_transaction=true but amount is null",
                 extra={"ctx": {"item_id": input.item_id}},
             )
-            return FinanceOutput(item_id=input.item_id, extraction_success=False)
+            decisions.append({
+                "agent_name": "finance_agent",
+                "action_taken": "rejected:missing-amount",
+                "reason": "is_transaction=true but amount field is null in LLM response",
+                "interrupt_tier": "log_only",
+            })
+            return FinanceOutput(item_id=input.item_id, extraction_success=False, decisions=decisions)
 
         try:
             amount = Decimal(str(amount_raw))
@@ -103,7 +116,13 @@ class FinanceAgent(BaseAgent):
                 "finance_agent: unparseable amount %r", amount_raw,
                 extra={"ctx": {"item_id": input.item_id}},
             )
-            return FinanceOutput(item_id=input.item_id, extraction_success=False)
+            decisions.append({
+                "agent_name": "finance_agent",
+                "action_taken": "rejected:unparseable-amount",
+                "reason": f"could not parse amount {amount_raw!r} as Decimal",
+                "interrupt_tier": "log_only",
+            })
+            return FinanceOutput(item_id=input.item_id, extraction_success=False, decisions=decisions)
 
         direction = extracted.get("direction") or "debit"
         merchant_raw = extracted.get("merchant")
@@ -128,13 +147,32 @@ class FinanceAgent(BaseAgent):
             tx_date=tx_date,
         )
 
+        if tx_id:
+            decisions.append({
+                "agent_name": "finance_agent",
+                "action_taken": f"transaction:written:{direction}",
+                "reason": f"{direction} {amount} merchant={merchant or 'unknown'} date={tx_date}",
+                "interrupt_tier": "log_only",
+            })
+        else:
+            decisions.append({
+                "agent_name": "finance_agent",
+                "action_taken": "transaction:failed",
+                "reason": "DB insert failed; see logs",
+                "interrupt_tier": "log_only",
+            })
+
+        recurrence_decision = None
         if tx_id and merchant:
-            _update_recurrence(merchant, amount, tx_date)
+            recurrence_decision = _update_recurrence(merchant, amount, tx_date)
+        if recurrence_decision:
+            decisions.append(recurrence_decision)
 
         return FinanceOutput(
             item_id=input.item_id,
             transaction_id=tx_id,
             extraction_success=tx_id is not None,
+            decisions=decisions,
         )
 
 
@@ -230,7 +268,7 @@ def _write_transaction(
         return None
 
 
-def _update_recurrence(merchant: str, amount: Decimal, tx_date: date) -> None:
+def _update_recurrence(merchant: str, amount: Decimal, tx_date: date) -> Optional[dict]:
     url = _db_url()
     if not url:
         return
@@ -244,7 +282,7 @@ def _update_recurrence(merchant: str, amount: Decimal, tx_date: date) -> None:
             ).fetchall()
 
             if len(rows) < _RECURRENCE_MIN_OCCURRENCES:
-                return
+                return None
 
             dates = [r[0] for r in rows]
             intervals = [(dates[i + 1] - dates[i]).days for i in range(len(dates) - 1)]
@@ -256,7 +294,7 @@ def _update_recurrence(merchant: str, amount: Decimal, tx_date: date) -> None:
                 None,
             )
             if matched_interval is None:
-                return
+                return None
 
             last_date = dates[-1]
             next_date = last_date + timedelta(days=matched_interval)
@@ -303,8 +341,15 @@ def _update_recurrence(merchant: str, amount: Decimal, tx_date: date) -> None:
                 extra={"ctx": {"merchant": merchant, "group_id": group_id,
                                "interval_days": matched_interval}},
             )
+            return {
+                "agent_name": "finance_agent",
+                "action_taken": f"recurrence:updated:{matched_interval}d",
+                "reason": f"merchant={merchant} next_expected={next_date} group_id={group_id}",
+                "interrupt_tier": "log_only",
+            }
     except Exception:
         logger.error("finance_agent: recurrence update failed", exc_info=True)
+    return None
 
 
 # ---------------------------------------------------------------------------
