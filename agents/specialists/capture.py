@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar, Optional
 
+from dateutil import parser as _dateutil_parser
+
 import httpx
 import psycopg
 from psycopg.types.json import Jsonb
@@ -143,6 +145,13 @@ class CaptureAgent(BaseAgent):
             )
 
         cls = _classify(input.raw, input.source, input.capture_type)
+
+        # Keyword override: LLM sometimes returns is_event=false for calls and meetings.
+        # If a date phrase was found and the text contains event-language, force true.
+        if cls.get("date_phrase") and not cls.get("is_event"):
+            if any(kw in input.raw.lower() for kw in _EVENT_KEYWORDS):
+                cls["is_event"] = True
+
         vector = _embed(input.raw)
         decisions: list[dict] = []
 
@@ -201,7 +210,7 @@ class CaptureAgent(BaseAgent):
                     decisions.append({
                         "agent_name":    "capture_agent",
                         "action_taken":  f"scheduled:{starts_at_dt.strftime('%Y-%m-%dT%H:%M')}",
-                        "reason":        f"{'time guessed (09:00 default)' if time_inferred else 'explicit time'} — parsed from: {cls.get('starts_at', '')}",
+                        "reason":        f"{'time guessed (09:00 default)' if time_inferred else 'explicit time'} — parsed from: {cls.get('date_phrase', '')}",
                         "interrupt_tier": "log_only",
                     })
 
@@ -275,36 +284,100 @@ class CaptureAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 
 _IST = timezone(timedelta(hours=5, minutes=30))
-_DATE_ONLY_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+_WEEKDAY_MAP: dict[str, int] = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+    "mon": 0, "tue": 1, "tues": 1, "wed": 2,
+    "thu": 3, "thur": 3, "thurs": 3,
+    "fri": 4, "sat": 5, "sun": 6,
+}
+_WEEKDAY_RE = re.compile(
+    r'^(?:next\s+|this\s+)?(' +
+    '|'.join(sorted(_WEEKDAY_MAP, key=len, reverse=True)) +
+    r')(?:\s+at\s+(.+))?$',
+    re.IGNORECASE,
+)
+_TIME_PRESENT_RE = re.compile(r'\d{1,2}[:h]\d{2}|\d{1,2}\s*(?:am|pm)', re.IGNORECASE)
+
+_EVENT_KEYWORDS = frozenset({"call", "meeting", "appointment", "lunch", "dinner", "meet"})
 
 
-def _parse_starts_at(raw: str | None, captured_at: datetime) -> tuple[datetime | None, bool]:
-    """Return (starts_at_dt, time_inferred).
-
-    date-only → 09:00 IST, time_inferred=True.
-    datetime  → parse as-is (assume IST if naive), time_inferred=False.
-    null/unparseable → (None, False).
-    Logs a warning when the result is more than 24 h before captured_at (backdating
-    may be legitimate but is worth surfacing in logs).
+def _make_ist_dt(d: object, time_str: str | None) -> tuple[datetime, bool]:
+    """Build an IST datetime from a date object and optional time string.
+    Returns (dt, time_inferred). time_str=None → 09:00, time_inferred=True.
     """
-    if not raw:
-        return None, False
-    s = str(raw).strip()
-    if _DATE_ONLY_RE.match(s):
-        y, m, d = int(s[:4]), int(s[5:7]), int(s[8:10])
-        dt = datetime(y, m, d, 9, 0, 0, tzinfo=_IST)
-        time_inferred = True
-    else:
+    if time_str:
         try:
-            dt = datetime.fromisoformat(s)
-        except ValueError:
-            logger.warning("starts_at parse failed: %r", s)
-            return None, False
+            t = _dateutil_parser.parse(time_str, default=datetime(2000, 1, 1, 0, 0, 0))
+            return datetime(d.year, d.month, d.day, t.hour, t.minute, 0, tzinfo=_IST), False
+        except Exception:
+            pass
+    return datetime(d.year, d.month, d.day, 9, 0, 0, tzinfo=_IST), True
+
+
+def _resolve_date_phrase(phrase: str | None, captured_at: datetime) -> tuple[datetime | None, bool]:
+    """Resolve a literal date phrase from the LLM to an IST datetime.
+
+    The model returns the verbatim phrase ("next Friday", "tomorrow at 3pm",
+    "25th September") — this function does all arithmetic, so the model never
+    computes dates.
+
+    Returns (starts_at_dt, time_inferred):
+      time_inferred=True when no time of day was stated (defaulted to 09:00 IST).
+      Returns (None, False) on empty input or parse failure.
+    Logs a warning when result is more than 24 h before captured_at.
+    """
+    if not phrase:
+        return None, False
+    p   = phrase.strip()
+    p_l = p.lower()
+    cap = captured_at if captured_at.tzinfo else captured_at.replace(tzinfo=_IST)
+
+    # today
+    if p_l == "today":
+        return _make_ist_dt(cap.date(), None)
+
+    # tonight
+    if p_l == "tonight":
+        return datetime(cap.year, cap.month, cap.day, 20, 0, 0, tzinfo=_IST), False
+
+    # tomorrow [at <time>]
+    if re.match(r'^tomorrow|^tmr(?:w)?$|^tom$', p_l):
+        time_part = re.sub(r'^tomorrow\s*(?:at\s*)?', '', p_l).strip() or None
+        return _make_ist_dt((cap + timedelta(days=1)).date(), time_part)
+
+    # in N days
+    m = re.match(r'^in\s+(\d+)\s+days?$', p_l)
+    if m:
+        return _make_ist_dt((cap + timedelta(days=int(m.group(1)))).date(), None)
+
+    # (next|this) <weekday> [at <time>]
+    wd_m = _WEEKDAY_RE.match(p_l)
+    if wd_m:
+        target_dow  = _WEEKDAY_MAP[wd_m.group(1).lower()]
+        cur_dow     = cap.weekday()                         # 0=Monday
+        days_ahead  = (target_dow - cur_dow) % 7 or 7      # 0 → next week
+        return _make_ist_dt((cap + timedelta(days=days_ahead)).date(), (wd_m.group(2) or "").strip() or None)
+
+    # dateutil fallback — absolute dates ("25th September", "Sep 25", "25/9/2026")
+    # Strip leading prepositions that confuse dateutil ("on the 25th" → "25th")
+    for _pfx in ("on the ", "on ", "by the ", "by ", "at "):
+        if p_l.startswith(_pfx):
+            p = p[len(_pfx):]
+            break
+    try:
+        default = datetime(cap.year, cap.month, cap.day, 9, 0, 0)
+        dt = _dateutil_parser.parse(p, default=default, dayfirst=True)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=_IST)
-        time_inferred = False
+        time_inferred = not bool(_TIME_PRESENT_RE.search(p))
+        if time_inferred:
+            dt = dt.replace(hour=9, minute=0, second=0, microsecond=0)
+    except Exception:
+        logger.warning("date_phrase parse failed: %r", phrase)
+        return None, False
 
-    cap = captured_at if captured_at.tzinfo else captured_at.replace(tzinfo=_IST)
     if dt < cap - timedelta(hours=24):
         logger.warning(
             "starts_at %s is more than 24h before capture time %s — possible misparse",
@@ -412,7 +485,7 @@ def _write_classification(
     Returns (starts_at_dt, time_inferred) so the caller can log a decision.
     """
     tags = cls.get("tags", [])
-    starts_at_dt, time_inferred = _parse_starts_at(cls.get("starts_at"), captured_at)
+    starts_at_dt, time_inferred = _resolve_date_phrase(cls.get("date_phrase"), captured_at)
     is_event = bool(cls.get("is_event", False))
     conn.execute(
         """UPDATE items SET

@@ -7,8 +7,8 @@ Captured at: {captured_at} IST
 {type_context}
 {quote_hint}
 
-Date parsing rules:
-- starts_at: if the text names a specific date or datetime, return it as YYYY-MM-DD (date only) or YYYY-MM-DDThh:mm:ss+05:30 (with time). Resolve relative expressions (tomorrow, next Friday, next week) from the "Captured at" time above. Return null if no date is mentioned.
+Date and event rules:
+- date_phrase: copy the exact words from the text that name a date or time ("next Friday", "tomorrow at 3pm", "on the 25th", "September 25"). Do not compute or rewrite. Return null if no date or time is mentioned.
 - is_event: true if something is happening *at* a time — a call, meeting, appointment, or any scheduled occurrence. False if the date is a deadline the task must be done *by*, or if no date is mentioned.
 
 Return exactly this structure:
@@ -18,7 +18,7 @@ Return exactly this structure:
   "tags": ["tag1", "tag2", "tag3"],
   "summary": "under 50 words",
   "action_class": "record|task|agent|alert|build",
-  "starts_at": null,
+  "date_phrase": null,
   "is_event": false
 }}
 
