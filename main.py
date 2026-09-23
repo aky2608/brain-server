@@ -937,6 +937,90 @@ async def get_planner(bucket: Optional[str] = None):
     return {"items": result.data}
 
 
+_CAL_COLS = (
+    "id, raw_content, title, ai_summary, category, action_class, task_status, "
+    "starts_at, ends_at, is_event, time_inferred, task_deadline, plan_date, plan_bucket"
+)
+
+@app.get("/calendar", dependencies=[Depends(verify_api_key)])
+async def get_calendar(
+    frm: str = Query(alias="from"),
+    to:  str = Query(),
+):
+    try:
+        frm_dt = datetime.fromisoformat(frm)
+        to_dt  = datetime.fromisoformat(to)
+    except ValueError:
+        raise HTTPException(400, "from/to must be ISO-8601 timestamps or dates")
+
+    frm_date = frm_dt.date()
+    to_date  = to_dt.date()
+
+    try:
+        with psycopg.connect(_db_url()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT {_CAL_COLS},
+                       CASE
+                         WHEN starts_at IS NOT NULL AND starts_at >= %s AND starts_at < %s
+                           THEN 'event'
+                         WHEN task_deadline IS NOT NULL
+                          AND task_deadline >= %s AND task_deadline < %s
+                           THEN 'deadline'
+                         WHEN plan_date IS NOT NULL
+                          AND plan_date >= %s AND plan_date < %s
+                           THEN 'planned'
+                         ELSE NULL
+                       END AS slot
+                FROM items
+                WHERE status = 'active'
+                  AND (
+                        (starts_at IS NOT NULL AND starts_at >= %s AND starts_at < %s)
+                     OR (task_deadline IS NOT NULL
+                         AND task_deadline >= %s AND task_deadline < %s)
+                     OR (plan_date IS NOT NULL
+                         AND plan_date >= %s AND plan_date < %s)
+                  )
+                ORDER BY COALESCE(starts_at,
+                                  task_deadline,
+                                  plan_date::timestamptz,
+                                  created_at)
+                """,
+                # CASE params (6), then WHERE params (6 pairs = 6)
+                (frm_dt, to_dt,        # CASE event
+                 frm_dt, to_dt,        # CASE deadline
+                 frm_date, to_date,    # CASE planned  (date column — pass date)
+                 frm_dt, to_dt,        # WHERE event
+                 frm_dt, to_dt,        # WHERE deadline
+                 frm_date, to_date),   # WHERE plan_date (date column — pass date)
+            ).fetchall()
+    except Exception:
+        logger.exception("get_calendar: DB query failed")
+        raise HTTPException(500, "query failed")
+
+    col_names = [
+        "id", "raw_content", "title", "ai_summary", "category", "action_class",
+        "task_status", "starts_at", "ends_at", "is_event", "time_inferred",
+        "task_deadline", "plan_date", "plan_bucket", "slot",
+    ]
+    items = []
+    for r in rows:
+        row = dict(zip(col_names, r))
+        if row["slot"] is None:
+            continue
+        # Compute ends_at for timed events that have none — not written to DB
+        if row["is_event"] and row["starts_at"] and not row["ends_at"]:
+            row["ends_at"] = (row["starts_at"] + timedelta(minutes=30)).isoformat()
+        for f in ("starts_at", "ends_at", "task_deadline"):
+            if row[f] is not None and not isinstance(row[f], str):
+                row[f] = row[f].isoformat()
+        if row["plan_date"] is not None and not isinstance(row["plan_date"], str):
+            row["plan_date"] = str(row["plan_date"])
+        items.append(row)
+
+    return {"items": items, "from": frm, "to": to}
+
+
 @app.get("/agent/today", dependencies=[Depends(verify_api_key)])
 async def get_agent_today():
     IST = timezone(timedelta(hours=5, minutes=30))

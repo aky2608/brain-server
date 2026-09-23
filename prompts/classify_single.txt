@@ -3,15 +3,23 @@ Classify this capture. Return ONLY valid JSON, no other text, no markdown.
 Content: {content}
 Source: {source}
 Type: {capture_type}
+Captured at: {captured_at} IST
 {type_context}
 {quote_hint}
+
+Date parsing rules:
+- starts_at: if the text names a specific date or datetime, return it as YYYY-MM-DD (date only) or YYYY-MM-DDThh:mm:ss+05:30 (with time). Resolve relative expressions (tomorrow, next Friday, next week) from the "Captured at" time above. Return null if no date is mentioned.
+- is_event: true if something is happening *at* a time — a call, meeting, appointment, or any scheduled occurrence. False if the date is a deadline the task must be done *by*, or if no date is mentioned.
+
 Return exactly this structure:
 {{
   "category": "learning|thoughts|work|life|resources|health",
   "subcategory": "wayclear|accrediq|finance|quotes|grocery|tech|hacks|music|null",
   "tags": ["tag1", "tag2", "tag3"],
   "summary": "under 50 words",
-  "action_class": "record|task|agent|alert|build"
+  "action_class": "record|task|agent|alert|build",
+  "starts_at": null,
+  "is_event": false
 }}
 
 Context: User is Ashish, solo founder building WayClear (road safety) and AccredIQ (IRC accreditation).

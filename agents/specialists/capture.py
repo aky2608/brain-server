@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar, Optional
 
@@ -183,8 +184,11 @@ class CaptureAgent(BaseAgent):
         url = os.environ.get("BRAIN_DB_URL", "")
         if url:
             try:
+                captured_at = datetime.now(_IST)
                 with psycopg.connect(url) as conn:
-                    _write_classification(input.capture_uuid, cls, conn)
+                    starts_at_dt, time_inferred = _write_classification(
+                        input.capture_uuid, cls, conn, captured_at
+                    )
                     if vector:
                         _store_embedding(input.capture_uuid, vector, conn)
                         embedding_stored = True
@@ -192,6 +196,14 @@ class CaptureAgent(BaseAgent):
                     if vector:
                         embedding_link_count = _link_embeddings(input.capture_uuid, vector, conn)
                     conn.commit()
+
+                if starts_at_dt:
+                    decisions.append({
+                        "agent_name":    "capture_agent",
+                        "action_taken":  f"scheduled:{starts_at_dt.strftime('%Y-%m-%dT%H:%M')}",
+                        "reason":        f"{'time guessed (09:00 default)' if time_inferred else 'explicit time'} — parsed from: {cls.get('starts_at', '')}",
+                        "interrupt_tier": "log_only",
+                    })
 
                 decisions.append({
                     "agent_name": "capture_agent",
@@ -262,7 +274,46 @@ class CaptureAgent(BaseAgent):
 # Classification
 # ---------------------------------------------------------------------------
 
-def _build_prompt(raw: str, source: str, capture_type: str) -> str:
+_IST = timezone(timedelta(hours=5, minutes=30))
+_DATE_ONLY_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _parse_starts_at(raw: str | None, captured_at: datetime) -> tuple[datetime | None, bool]:
+    """Return (starts_at_dt, time_inferred).
+
+    date-only → 09:00 IST, time_inferred=True.
+    datetime  → parse as-is (assume IST if naive), time_inferred=False.
+    null/unparseable → (None, False).
+    Logs a warning when the result is more than 24 h before captured_at (backdating
+    may be legitimate but is worth surfacing in logs).
+    """
+    if not raw:
+        return None, False
+    s = str(raw).strip()
+    if _DATE_ONLY_RE.match(s):
+        y, m, d = int(s[:4]), int(s[5:7]), int(s[8:10])
+        dt = datetime(y, m, d, 9, 0, 0, tzinfo=_IST)
+        time_inferred = True
+    else:
+        try:
+            dt = datetime.fromisoformat(s)
+        except ValueError:
+            logger.warning("starts_at parse failed: %r", s)
+            return None, False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_IST)
+        time_inferred = False
+
+    cap = captured_at if captured_at.tzinfo else captured_at.replace(tzinfo=_IST)
+    if dt < cap - timedelta(hours=24):
+        logger.warning(
+            "starts_at %s is more than 24h before capture time %s — possible misparse",
+            dt.isoformat(), cap.isoformat(),
+        )
+    return dt, time_inferred
+
+
+def _build_prompt(raw: str, source: str, capture_type: str, captured_at: datetime) -> str:
     type_context = {
         "url": "This is extracted text from a web page. Classify by the page content, not the URL string.",
         "youtube": "This is a YouTube video transcript. Classify by the video content/topic.",
@@ -280,10 +331,12 @@ def _build_prompt(raw: str, source: str, capture_type: str) -> str:
          (stripped.startswith("'") and stripped.endswith("'") and len(stripped) > 10):
         quote_hint = "If this looks like a quote or saying, set category=learning, subcategory=quotes, and include the author in tags if identifiable."
 
+    captured_at_str = captured_at.strftime("%A %Y-%m-%d %H:%M")
     return _load_prompt().format(
         content=raw[:1000],
         source=source,
         capture_type=capture_type,
+        captured_at=captured_at_str,
         type_context=type_context,
         quote_hint=quote_hint,
     )
@@ -301,7 +354,7 @@ def _call_1minai_sync(prompt: str, model: str) -> str:
 
 
 def _classify(raw: str, source: str, capture_type: str) -> dict:
-    prompt = _build_prompt(raw, source, capture_type)
+    prompt = _build_prompt(raw, source, capture_type, datetime.now(_IST))
     try:
         resp = _call_1minai_sync(prompt, _ONEMIN_MODEL)
     except Exception:
@@ -351,8 +404,16 @@ def _embed(text: str) -> Optional[list[float]]:
 # Write helpers — all accept an open connection; caller owns commit
 # ---------------------------------------------------------------------------
 
-def _write_classification(item_id: str, cls: dict, conn: psycopg.Connection) -> None:
+def _write_classification(
+    item_id: str, cls: dict, conn: psycopg.Connection, captured_at: datetime
+) -> tuple[datetime | None, bool]:
+    """Write classification + temporal fields in a single UPDATE.
+
+    Returns (starts_at_dt, time_inferred) so the caller can log a decision.
+    """
     tags = cls.get("tags", [])
+    starts_at_dt, time_inferred = _parse_starts_at(cls.get("starts_at"), captured_at)
+    is_event = bool(cls.get("is_event", False))
     conn.execute(
         """UPDATE items SET
                category              = %s,
@@ -360,7 +421,10 @@ def _write_classification(item_id: str, cls: dict, conn: psycopg.Connection) -> 
                ai_tags               = %s,
                ai_summary            = %s,
                action_class          = %s,
-               classification_status = 'done'
+               classification_status = 'done',
+               starts_at             = %s,
+               is_event              = %s,
+               time_inferred         = %s
            WHERE id = %s""",
         (
             cls.get("category", "thoughts"),
@@ -368,9 +432,13 @@ def _write_classification(item_id: str, cls: dict, conn: psycopg.Connection) -> 
             Jsonb(tags),
             cls.get("summary", ""),
             cls.get("action_class", "record"),
+            starts_at_dt,
+            is_event,
+            time_inferred,
             item_id,
         ),
     )
+    return starts_at_dt, time_inferred
 
 
 def _store_embedding(item_id: str, vector: list[float], conn: psycopg.Connection) -> None:
