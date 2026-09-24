@@ -84,7 +84,7 @@ FALLBACK_MODEL = "gpt-4.1-nano"
 _AGENT_REGISTRY = [
     {"name": "watch_agent",      "trigger": "loop",     "interval_hours": 1,    "detail": "hourly eval loop; also /watch alias"},
     {"name": "capture_agent",    "trigger": "reactive", "interval_hours": None, "detail": "fires on POST /capture; batch sweep every 2 min"},
-    {"name": "scheduling_agent", "trigger": "manual",   "interval_hours": None, "detail": "/plan alias — never runs on a schedule"},
+    {"name": "scheduling_agent", "trigger": "loop",     "interval_hours": 24,   "detail": "6:30am IST daily via brain-scheduler.timer; /plan alias for manual"},
     {"name": "finance_agent",    "trigger": "reactive", "interval_hours": None, "detail": "routed by personal agent on capture"},
     {"name": "why_agent",        "trigger": "reactive", "interval_hours": None, "detail": "routed by personal agent — no slash alias"},
     {"name": "notebook_agent",   "trigger": "manual",   "interval_hours": None, "detail": "/gate alias"},

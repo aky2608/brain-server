@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Brain scheduling agent at 6:30am IST daily
+
+[Timer]
+OnCalendar=*-*-* 06:30:00 Asia/Kolkata
+Persistent=true
+Unit=brain-scheduler.service
+
+[Install]
+WantedBy=timers.target

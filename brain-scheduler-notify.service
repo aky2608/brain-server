@@ -1,0 +1,12 @@
+[Unit]
+Description=Notify on brain-scheduler failure
+
+[Service]
+Type=oneshot
+User=ashish
+WorkingDirectory=/opt/brain
+EnvironmentFile=/opt/brain/.env
+ExecStart=/opt/brain/venv/bin/python /opt/brain/notify_failure.py "brain-scheduler FAILED — daily /plan not enqueued. Check: journalctl -u brain-scheduler"
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=brain-scheduler-notify
