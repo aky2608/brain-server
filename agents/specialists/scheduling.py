@@ -1,14 +1,17 @@
 """
 SchedulingAgent — deterministic plan enforcement, zero LLM.
 
-Four invariants applied in order on every run:
-  1. rollover_yesterday   — unfinished today-items from prior dates get plan_date=today
+Five invariants applied in order on every run:
+  1. promote_dated_items  — active tasks with starts_at ≤ today (IST) and no bucket
+                            get plan_bucket='today'; overdue dated tasks surface here
+                            rather than staying invisible forever.
+  2. rollover_yesterday   — unfinished today-items from prior dates get plan_date=today
                             and a visible rollover_note; they never silently vanish.
-  2. enforce_50pct_rule   — tasks <50% done with <6h to deadline are pushed to tomorrow
+  3. enforce_50pct_rule   — tasks <50% done with <6h to deadline are pushed to tomorrow
                             (too late to finish; reschedule rather than fail).
-  3. energy_aware_sort    — if latest energy_score ≤ 2, heavy tasks (build/wayclear/accrediq)
+  4. energy_aware_sort    — if latest energy_score ≤ 2, heavy tasks (build/wayclear/accrediq)
                             are moved out of Today; degrades silently with no reading.
-  4. enforce_max5         — at most 5 *pending* items stay in Today; excess queues to
+  5. enforce_max5         — at most 5 *pending* items stay in Today; excess queues to
                             this_week, never force-displacing in_progress work.
 
 Decisions are returned in SchedulingOutput.decisions for personal_agent to
@@ -65,6 +68,7 @@ class SchedulingAgent(BaseAgent):
 
         try:
             with psycopg.connect(url) as conn:
+                _promote_dated_items(conn, decisions)
                 rolled = _rollover_yesterday(conn, decisions)
                 rescheduled = _enforce_50pct_rule(conn, decisions)
                 _energy_aware_sort(conn, decisions)
@@ -98,6 +102,50 @@ class SchedulingAgent(BaseAgent):
 # ---------------------------------------------------------------------------
 # Invariant helpers — each mutates DB and appends to decisions list
 # ---------------------------------------------------------------------------
+
+def _promote_dated_items(conn: psycopg.Connection, decisions: list[dict]) -> list[str]:
+    """
+    Tasks with starts_at ≤ today (IST) and no bucket enter Today.
+    Runs first so promoted items are subject to all subsequent invariants,
+    including the max-5 cap which demotes excess to this_week.
+    plan_order=NULL gives them lowest demotion priority (NULLS LAST in max-5 sort).
+    """
+    today_ist = conn.execute(
+        "SELECT (now() AT TIME ZONE 'Asia/Kolkata')::date"
+    ).fetchone()[0]
+
+    rows = conn.execute(
+        """SELECT id, starts_at FROM items
+            WHERE action_class = 'task'
+              AND task_status IS DISTINCT FROM 'done'
+              AND status = 'active'
+              AND plan_bucket IS NULL
+              AND (starts_at AT TIME ZONE 'Asia/Kolkata')::date <= %s""",
+        (today_ist,),
+    ).fetchall()
+
+    if not rows:
+        return []
+
+    ids = [str(r[0]) for r in rows]
+    for item_id, starts_at in rows:
+        matched_date = starts_at.date() if hasattr(starts_at, 'date') else starts_at
+        conn.execute(
+            """UPDATE items
+                  SET plan_bucket = 'today',
+                      plan_date   = %s,
+                      plan_order  = NULL
+                WHERE id = %s""",
+            (today_ist, item_id),
+        )
+        decisions.append({
+            "action_taken": "promote_dated",
+            "reason": f"starts_at {matched_date} ≤ today ({today_ist}) — promoted to Today",
+            "item_id": str(item_id),
+        })
+
+    return ids
+
 
 def _rollover_yesterday(conn: psycopg.Connection, decisions: list[dict]) -> list[str]:
     """
