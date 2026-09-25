@@ -9,6 +9,7 @@ SHADOW_MODE = False : writes classification + embedding to items, then runs wiki
 import json
 import logging
 import os
+import random
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -470,6 +471,23 @@ def _resolve_date_phrase(phrase: str | None, captured_at: datetime) -> tuple[dat
     return dt, time_inferred
 
 
+# Non-confusable alphabet for 3-char conflict codes: no 0/O, no 1/l/I.
+_CODE_CHARS = "abcdefghjkmnpqrstuvwxyz23456789"
+
+
+def _gen_conflict_code(conn: psycopg.Connection) -> str:
+    """Return a 3-char code unique among currently-open conflicts."""
+    for _ in range(20):
+        code = "".join(random.choices(_CODE_CHARS, k=3))
+        exists = conn.execute(
+            "SELECT 1 FROM calendar_conflicts WHERE code = %s AND status = 'pending'",
+            (code,),
+        ).fetchone()
+        if exists is None:
+            return code
+    raise RuntimeError("could not generate unique conflict code after 20 attempts")
+
+
 def _check_calendar_conflict(
     item_id: str,
     starts_at: datetime,
@@ -519,14 +537,21 @@ def _check_calendar_conflict(
             ex_id, ex_title, ex_raw, ex_starts, ex_ends = existing
             ex_name = (ex_title or ex_raw or "").strip()[:60]
 
+            # Count other open conflicts before inserting — determines message format
+            other_open = conn.execute(
+                "SELECT COUNT(*) FROM calendar_conflicts WHERE status='pending' AND new_item_id != %s",
+                (item_id,),
+            ).fetchone()[0]
+
             # Insert conflict row; skip silently if this new item already has one open
             conn.execute("SAVEPOINT sp_cc")
             try:
+                code = _gen_conflict_code(conn)
                 conflict_id = str(conn.execute(
                     """INSERT INTO calendar_conflicts
-                           (new_item_id, existing_item_id, status, asked_at)
-                       VALUES (%s, %s, 'pending', now()) RETURNING id""",
-                    (item_id, str(ex_id)),
+                           (new_item_id, existing_item_id, status, code, asked_at)
+                       VALUES (%s, %s, 'pending', %s, now()) RETURNING id""",
+                    (item_id, str(ex_id), code),
                 ).fetchone()[0])
                 conn.execute("RELEASE SAVEPOINT sp_cc")
             except psycopg.errors.UniqueViolation:
@@ -537,8 +562,6 @@ def _check_calendar_conflict(
                     item_id,
                 )
                 return None
-
-            code = conflict_id.replace("-", "")[-6:]
 
             new_end  = starts_at + timedelta(minutes=EVENT_DEFAULT_MINUTES)
             new_time = (f"{starts_at.astimezone(_IST).strftime('%H:%M')}"
@@ -551,13 +574,25 @@ def _check_calendar_conflict(
                           ).astimezone(_IST).strftime("%H:%M")
                 ex_time = f"{ex_start_s}\u2013{ex_end}"
 
-            msg = (
-                f"\u26a0\ufe0f Conflict: \u201c{new_name}\u201d ({new_time}) "
-                f"clashes with \u201c{ex_name}\u201d ({ex_time})\n\n"
-                f"KEEP {code} \u2014 keep both\n"
-                f"MOVE {code} \u2014 unplan new item\n"
-                f"CANCEL {code} \u2014 delete new item"
-            )
+            if other_open == 0:
+                # Single open conflict — no code needed in replies
+                msg = (
+                    f"\u26a0\ufe0f Conflict: \u201c{new_name}\u201d ({new_time}) "
+                    f"clashes with \u201c{ex_name}\u201d ({ex_time})\n\n"
+                    f"KEEP \u2014 keep both\n"
+                    f"MOVE 5pm \u2014 reschedule (e.g. MOVE 5pm, MOVE tomorrow at 10am)\n"
+                    f"MOVE \u2014 unplan (clear time)\n"
+                    f"CANCEL \u2014 delete"
+                )
+            else:
+                msg = (
+                    f"\u26a0\ufe0f Conflict: \u201c{new_name}\u201d ({new_time}) "
+                    f"clashes with \u201c{ex_name}\u201d ({ex_time}) [{code}]\n\n"
+                    f"KEEP {code} \u2014 keep both\n"
+                    f"MOVE {code} 5pm \u2014 reschedule\n"
+                    f"MOVE {code} \u2014 unplan\n"
+                    f"CANCEL {code} \u2014 delete"
+                )
 
             if chat_id:
                 conn.execute(
