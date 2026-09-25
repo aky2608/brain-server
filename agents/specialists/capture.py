@@ -18,7 +18,10 @@ from dateutil import parser as _dateutil_parser
 
 import httpx
 import psycopg
+import psycopg.errors
 from psycopg.types.json import Jsonb
+
+from constants import EVENT_DEFAULT_MINUTES
 
 from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowModel
 from shortcuts import parse_slash
@@ -268,6 +271,23 @@ class CaptureAgent(BaseAgent):
                         extra={"ctx": {"item_id": input.capture_uuid}},
                         exc_info=True,
                     )
+
+                # Calendar conflict detection — separate transaction, after commit.
+                # Trigger only when the new item has an explicit time (time_inferred=False),
+                # since a 09:00 default nobody chose shouldn't generate conflicts.
+                if starts_at_dt and not time_inferred:
+                    conflict = _check_calendar_conflict(input.capture_uuid, starts_at_dt, url)
+                    if conflict:
+                        decisions.append({
+                            "agent_name":    "capture_agent",
+                            "action_taken":  f"conflict_detected:{conflict['conflict_id'][:8]}",
+                            "reason":        (
+                                f"overlaps with \u201c{conflict['existing_name']}\u201d "
+                                f"\u2014 asked KEEP/MOVE/CANCEL {conflict['code']}"
+                            ),
+                            "interrupt_tier": "log_only",
+                        })
+
             except Exception:
                 logger.error(
                     "capture_agent write phase failed",
@@ -448,6 +468,118 @@ def _resolve_date_phrase(phrase: str | None, captured_at: datetime) -> tuple[dat
             dt.isoformat(), cap.isoformat(),
         )
     return dt, time_inferred
+
+
+def _check_calendar_conflict(
+    item_id: str,
+    starts_at: datetime,
+    url: str,
+) -> dict | None:
+    """Detect overlapping events after the new item is committed.
+
+    Returns a dict {conflict_id, code, existing_name} when a conflict row is
+    written and a message is queued, or None when there is nothing to report.
+    """
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    try:
+        with psycopg.connect(url) as conn:
+            # Name for the new item (written a moment ago)
+            new_row = conn.execute(
+                "SELECT title, raw_content FROM items WHERE id = %s", (item_id,)
+            ).fetchone()
+            if not new_row:
+                return None
+            new_name = (new_row[0] or new_row[1] or "").strip()[:60]
+
+            # Overlap condition (half-open intervals):
+            #   new window: [starts_at, starts_at + DEFAULT)
+            #   existing:   [ex.starts_at, COALESCE(ex.ends_at, ex.starts_at + DEFAULT))
+            # overlap iff: ex.starts_at < new_end AND ex_end > starts_at
+            # Candidates: any active item with an explicit time (time_inferred=false),
+            # regardless of is_event — the classifier is unreliable on that flag.
+            existing = conn.execute(
+                """SELECT id, title, raw_content, starts_at, ends_at
+                     FROM items
+                    WHERE status = 'active'
+                      AND starts_at IS NOT NULL
+                      AND time_inferred = false
+                      AND id != %s
+                      AND starts_at < %s + make_interval(mins => %s)
+                      AND COALESCE(ends_at,
+                              starts_at + make_interval(mins => %s)) > %s
+                    ORDER BY starts_at
+                    LIMIT 1""",
+                (item_id, starts_at, EVENT_DEFAULT_MINUTES,
+                 EVENT_DEFAULT_MINUTES, starts_at),
+            ).fetchone()
+
+            if not existing:
+                return None
+
+            ex_id, ex_title, ex_raw, ex_starts, ex_ends = existing
+            ex_name = (ex_title or ex_raw or "").strip()[:60]
+
+            # Insert conflict row; skip silently if this new item already has one open
+            conn.execute("SAVEPOINT sp_cc")
+            try:
+                conflict_id = str(conn.execute(
+                    """INSERT INTO calendar_conflicts
+                           (new_item_id, existing_item_id, status, asked_at)
+                       VALUES (%s, %s, 'pending', now()) RETURNING id""",
+                    (item_id, str(ex_id)),
+                ).fetchone()[0])
+                conn.execute("RELEASE SAVEPOINT sp_cc")
+            except psycopg.errors.UniqueViolation:
+                conn.execute("ROLLBACK TO SAVEPOINT sp_cc")
+                conn.execute("RELEASE SAVEPOINT sp_cc")
+                logger.info(
+                    "calendar_conflict: open conflict already exists for new_item %s — skipping",
+                    item_id,
+                )
+                return None
+
+            code = conflict_id.replace("-", "")[-6:]
+
+            new_end  = starts_at + timedelta(minutes=EVENT_DEFAULT_MINUTES)
+            new_time = (f"{starts_at.astimezone(_IST).strftime('%H:%M')}"
+                        f"\u2013{new_end.astimezone(_IST).strftime('%H:%M')}")
+            ex_start_s = ex_starts.astimezone(_IST).strftime("%H:%M") if ex_starts else "?"
+            if ex_ends:
+                ex_time = f"{ex_start_s}\u2013{ex_ends.astimezone(_IST).strftime('%H:%M')}"
+            else:
+                ex_end = (ex_starts + timedelta(minutes=EVENT_DEFAULT_MINUTES)
+                          ).astimezone(_IST).strftime("%H:%M")
+                ex_time = f"{ex_start_s}\u2013{ex_end}"
+
+            msg = (
+                f"\u26a0\ufe0f Conflict: \u201c{new_name}\u201d ({new_time}) "
+                f"clashes with \u201c{ex_name}\u201d ({ex_time})\n\n"
+                f"KEEP {code} \u2014 keep both\n"
+                f"MOVE {code} \u2014 unplan new item\n"
+                f"CANCEL {code} \u2014 delete new item"
+            )
+
+            if chat_id:
+                conn.execute(
+                    "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
+                    (chat_id, msg),
+                )
+
+            conn.commit()
+
+            logger.info(
+                "calendar_conflict: detected",
+                extra={"ctx": {
+                    "new_item_id": item_id,
+                    "existing_item_id": str(ex_id),
+                    "conflict_id": conflict_id,
+                }},
+            )
+            return {"conflict_id": conflict_id, "code": code, "existing_name": ex_name}
+
+    except Exception:
+        logger.warning("calendar_conflict check failed", exc_info=True)
+        return None
 
 
 def _build_prompt(raw: str, source: str, capture_type: str, captured_at: datetime) -> str:

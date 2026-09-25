@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import Client, create_client
 
+from constants import EVENT_DEFAULT_MINUTES
 from shortcuts import lookup_shortcut, parse_slash
 
 load_dotenv()
@@ -1010,7 +1011,7 @@ async def get_calendar(
             continue
         # Compute ends_at for timed events that have none — not written to DB
         if row["is_event"] and row["starts_at"] and not row["ends_at"]:
-            row["ends_at"] = (row["starts_at"] + timedelta(minutes=30)).isoformat()
+            row["ends_at"] = (row["starts_at"] + timedelta(minutes=EVENT_DEFAULT_MINUTES)).isoformat()
         for f in ("starts_at", "ends_at", "task_deadline"):
             if row[f] is not None and not isinstance(row[f], str):
                 row[f] = row[f].isoformat()

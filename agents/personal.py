@@ -12,7 +12,8 @@ from langgraph.graph import END
 from agents.base import GraphState
 from shortcuts import lookup_shortcut, parse_slash
 
-_CONFLICT_RE = re.compile(r"^(yes|no|skip)(?:\s+([0-9a-f]{6}))?(?=\s|$)", re.IGNORECASE)
+_CONFLICT_RE     = re.compile(r"^(yes|no|skip)(?:\s+([0-9a-f]{6}))?(?=\s|$)", re.IGNORECASE)
+_CAL_CONFLICT_RE = re.compile(r"^(keep|move|cancel)(?:\s+([0-9a-f]{6}))?(?=\s|$)", re.IGNORECASE)
 
 load_dotenv()
 
@@ -37,6 +38,80 @@ DISPATCH_MAP: dict[str, str] = {
 
 def _db_url() -> str:
     return os.environ.get("BRAIN_DB_URL", "")
+
+
+def _get_pending_calendar_conflicts() -> list[dict]:
+    url = _db_url()
+    if not url:
+        return []
+    try:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(
+                """SELECT id, new_item_id FROM calendar_conflicts
+                   WHERE status = 'pending'
+                   ORDER BY created_at LIMIT 5"""
+            ).fetchall()
+        return [{"id": str(r[0]), "new_item_id": str(r[1])} for r in rows]
+    except Exception:
+        logger.exception("calendar_conflicts poll failed")
+        return []
+
+
+def _resolve_calendar_conflict(
+    conflict: dict,
+    answer: str,
+    source: str,
+    item_id: Optional[str],
+) -> None:
+    """Apply KEEP/MOVE/CANCEL answer in a single atomic transaction."""
+    url = _db_url()
+    if not url:
+        return
+    conflict_id  = conflict["id"]
+    new_item_id  = conflict["new_item_id"]
+    try:
+        with psycopg.connect(url) as conn:
+            chat_row  = conn.execute(
+                "SELECT metadata->>'chat_id' FROM items WHERE id = %s", (item_id,)
+            ).fetchone() if item_id else None
+            recipient = str(chat_row[0]) if chat_row and chat_row[0] else source
+
+            if answer == "keep":
+                conn.execute(
+                    "UPDATE calendar_conflicts SET status='kept', resolved_at=now() WHERE id=%s",
+                    (conflict_id,),
+                )
+                reply = "Kept both \u2014 calendar unchanged."
+
+            elif answer == "move":
+                conn.execute(
+                    "UPDATE calendar_conflicts SET status='moved', resolved_at=now() WHERE id=%s",
+                    (conflict_id,),
+                )
+                # Clear the scheduled slot; item stays active and unplanned
+                conn.execute(
+                    """UPDATE items
+                          SET starts_at=NULL, is_event=false, time_inferred=false
+                        WHERE id=%s""",
+                    (new_item_id,),
+                )
+                reply = "Moved to unplanned \u2014 starts_at cleared. Reschedule when ready."
+
+            else:  # cancel
+                conn.execute(
+                    "UPDATE calendar_conflicts SET status='cancelled', resolved_at=now() WHERE id=%s",
+                    (conflict_id,),
+                )
+                conn.execute("UPDATE items SET status='inactive' WHERE id=%s", (new_item_id,))
+                reply = "Cancelled \u2014 item removed."
+
+            conn.execute(
+                "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
+                (recipient, reply),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("calendar_conflict resolution failed")
 
 
 def _get_pending_conflicts() -> list[dict]:
@@ -252,6 +327,48 @@ def personal_agent_node(state: GraphState) -> dict:
                 )
                 return {"routed_to": None, "specialist_result": {"handled": "conflict_ambiguous"}}
         # CONFLICT_RE matched but no pending conflicts — fall through to normal routing.
+
+    # 0b. Calendar conflict reply — KEEP/MOVE/CANCEL [6-char code]
+    m_cal = _CAL_CONFLICT_RE.match(raw)
+    if m_cal:
+        pending_cal = _get_pending_calendar_conflicts()
+        if pending_cal:
+            answer = m_cal.group(1).lower()
+            code   = m_cal.group(2).lower() if m_cal.group(2) else None
+            if code:
+                conflict = next(
+                    (c for c in pending_cal if str(c["id"]).replace("-", "")[-6:] == code), None
+                )
+                if conflict:
+                    _resolve_calendar_conflict(conflict, answer, state.get("source", ""), item_id)
+                    _log_decision(
+                        "capture_agent", f"calendar_conflict:{answer}:{code}",
+                        f"user answered {answer!r} for conflict {conflict['id']}",
+                        "log_only", item_id=conflict["new_item_id"],
+                    )
+                    return {"routed_to": None, "specialist_result": {"handled": f"calendar_conflict:{answer}"}}
+                known = ", ".join(str(c["id"]).replace("-", "")[-6:] for c in pending_cal)
+                _write_outbox_direct(state.get("source", ""),
+                                     f"Code {code} not found. Open: {known}")
+                return {"routed_to": None, "specialist_result": {"handled": "cal_conflict_code_unknown"}}
+            elif len(pending_cal) == 1:
+                _resolve_calendar_conflict(pending_cal[0], answer, state.get("source", ""), item_id)
+                _log_decision(
+                    "capture_agent", f"calendar_conflict:{answer}:implicit",
+                    f"user answered {answer!r} for conflict {pending_cal[0]['id']}",
+                    "log_only", item_id=pending_cal[0]["new_item_id"],
+                )
+                return {"routed_to": None, "specialist_result": {"handled": f"calendar_conflict:{answer}"}}
+            else:
+                known = ", ".join(str(c["id"]).replace("-", "")[-6:] for c in pending_cal)
+                first_code = str(pending_cal[0]["id"]).replace("-", "")[-6:]
+                _write_outbox_direct(
+                    state.get("source", ""),
+                    f"Multiple open calendar conflicts \u2014 include the code, "
+                    f"e.g. KEEP {first_code}\nOpen: {known}",
+                )
+                return {"routed_to": None, "specialist_result": {"handled": "cal_conflict_ambiguous"}}
+        # _CAL_CONFLICT_RE matched but no pending calendar conflicts — fall through.
 
     # 1. why/explain hard fork — no LLM; reads agent_decisions
     if lower.startswith("why") or lower.startswith("explain"):

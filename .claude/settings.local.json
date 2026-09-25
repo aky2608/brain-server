@@ -63,7 +63,9 @@
       "Read(//etc/nginx/sites-enabled/**)",
       "Read(//etc/nginx/conf.d/**)",
       "Bash(curl -s -o /dev/null -w \"%{http_code}\" -H \"X-API-Key: 975c6eb4d8ea42dd5ac3a1776c387cedc4b4ce23ad94dbaad0107ff9443ae6a4\" http://localhost:8100/builds)",
-      "Bash(xargs -I {} basename {} .py)"
+      "Bash(xargs -I {} basename {} .py)",
+      "Read(//var/www/brain/**)",
+      "Read(//opt/brain-infra/www/**)"
     ]
   }
 }
