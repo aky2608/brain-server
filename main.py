@@ -1141,7 +1141,71 @@ async def get_dashboard_summary():
             "SELECT category, COUNT(*) FROM items WHERE created_at >= %s GROUP BY category",
             (week_start,),
         ).fetchall()
+
+        # gate tile — read window_days and min_required from the rule so the
+        # tile and the watch rule can never drift independently
+        gate_rule_row = conn.execute(
+            """
+            SELECT (condition->>'min_required')::int,
+                   (condition->>'window_days')::int
+              FROM agent_watch_rules
+             WHERE rule_type = 'gate_missed' AND enabled = true
+             LIMIT 1
+            """
+        ).fetchone()
+        _g_target = gate_rule_row[0] if gate_rule_row else 3
+        _g_window = gate_rule_row[1] if gate_rule_row else 7
+
+        gate_drills_row = conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM drill_sessions
+             WHERE ended_at IS NOT NULL
+               AND started_at >= NOW() - (%s * INTERVAL '1 day')
+            """,
+            (_g_window,),
+        ).fetchone()
+
+        gate_last_row = conn.execute(
+            "SELECT MAX(started_at) FROM drill_sessions WHERE ended_at IS NOT NULL"
+        ).fetchone()
+
+        gate_avg_row = conn.execute(
+            """
+            SELECT AVG(score_avg)
+              FROM drill_sessions
+             WHERE ended_at IS NOT NULL
+               AND started_at >= NOW() - (%s * INTERVAL '1 day')
+            """,
+            (_g_window,),
+        ).fetchone()
+
+        gate_q_due_row = conn.execute(
+            """
+            SELECT COUNT(*)
+              FROM revision_questions
+             WHERE next_review_date <= CURRENT_DATE
+               AND archived_at IS NULL
+            """
+        ).fetchone()
+
+        gate_nb_row = conn.execute(
+            "SELECT COUNT(*) FROM notebooks WHERE archived_at IS NULL"
+        ).fetchone()
+
     by_category = {(r[0] or "uncategorized"): r[1] for r in cat_rows}
+
+    _g_last = gate_last_row[0].isoformat() if gate_last_row and gate_last_row[0] else None
+    _g_avg  = float(gate_avg_row[0]) if gate_avg_row and gate_avg_row[0] is not None else None
+    gate_data = {
+        "drills_7d":    gate_drills_row[0] if gate_drills_row else 0,
+        "drills_target": _g_target,
+        "window_days":   _g_window,
+        "questions_due": gate_q_due_row[0] if gate_q_due_row else 0,
+        "notebooks":     gate_nb_row[0] if gate_nb_row else 0,
+        "last_drill":    _g_last,
+        "avg_score_7d":  _g_avg,
+    }
 
     # interrupts tile — same query as /agent/today
     r_interrupts = (
@@ -1196,7 +1260,7 @@ async def get_dashboard_summary():
             "failed_24h":      r_failed.count or 0,
             "latest":          r_latest.data[0] if r_latest.data else None,
         },
-        "gate":     None,
+        "gate":     gate_data,
         "revision": None,
         "finance":  None,
         "people":   None,
