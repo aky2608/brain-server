@@ -146,6 +146,16 @@ class CaptureAgent(BaseAgent):
 
         cls = _classify(input.raw, input.source, input.capture_type)
 
+        # Regex pre-pass: deterministic extraction wins; LLM date_phrase is the fallback.
+        _regex_phrase = _extract_date_phrase(input.raw)
+        if _regex_phrase:
+            cls["date_phrase"] = _regex_phrase
+            _date_source = f"regex:{_regex_phrase}"
+        elif cls.get("date_phrase"):
+            _date_source = f"model:{cls['date_phrase']}"
+        else:
+            _date_source = "none"
+
         # Keyword override: LLM sometimes returns is_event=false for calls and meetings.
         # If a date phrase was found and the text contains event-language, force true.
         if cls.get("date_phrase") and not cls.get("is_event"):
@@ -210,7 +220,7 @@ class CaptureAgent(BaseAgent):
                     decisions.append({
                         "agent_name":    "capture_agent",
                         "action_taken":  f"scheduled:{starts_at_dt.strftime('%Y-%m-%dT%H:%M')}",
-                        "reason":        f"{'time guessed (09:00 default)' if time_inferred else 'explicit time'} — parsed from: {cls.get('date_phrase', '')}",
+                        "reason":        f"{'time guessed (09:00 default)' if time_inferred else 'explicit time'} — source:{_date_source}",
                         "interrupt_tier": "log_only",
                     })
 
@@ -302,6 +312,52 @@ _TIME_PRESENT_RE = re.compile(r'\d{1,2}[:h]\d{2}|\d{1,2}\s*(?:am|pm)', re.IGNORE
 
 _EVENT_KEYWORDS = frozenset({"call", "meeting", "appointment", "lunch", "dinner", "meet"})
 
+# ---------------------------------------------------------------------------
+# Regex date pre-pass — runs before classify, regex result wins over LLM
+# ---------------------------------------------------------------------------
+
+_WEEKDAYS_PAT = '|'.join(sorted(_WEEKDAY_MAP, key=len, reverse=True))
+
+# Optional time suffix matched inline: "at 6pm", "at 18:00", "at 6:30am"
+_TS = r'(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)|\s+at\s+\d{1,2}:\d{2})'
+
+_DATE_PREPASS_RE: list[re.Pattern] = [
+    # longest/most specific first to avoid partial matches
+    re.compile(r'\bday\s+after\s+tomorrow' + _TS + r'?', re.IGNORECASE),
+    re.compile(r'\btonight\b', re.IGNORECASE),
+    re.compile(r'\btoday' + _TS + r'?', re.IGNORECASE),
+    re.compile(r'\b(?:tomorrow|tmrw?|tom)\b' + _TS + r'?', re.IGNORECASE),
+    re.compile(r'\b(?:next\s+|this\s+)?(?:' + _WEEKDAYS_PAT + r')\b' + _TS + r'?', re.IGNORECASE),
+    re.compile(r'\bin\s+\d+\s+(?:days?|weeks?)\b', re.IGNORECASE),
+    re.compile(r'\b\d{4}-\d{2}-\d{2}\b'),
+    re.compile(r'\b\d{1,2}/\d{1,2}/\d{4}\b'),
+    re.compile(r'\bon\s+the\s+\d{1,2}(?:st|nd|rd|th)\b' + _TS + r'?', re.IGNORECASE),
+    re.compile(
+        r'\b\d{1,2}(?:st|nd|rd|th)\s+'
+        r'(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?'
+        r'|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b'
+        + _TS + r'?',
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r'\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?'
+        r'|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)'
+        r'\s+\d{1,2}(?:st|nd|rd|th)?\b' + _TS + r'?',
+        re.IGNORECASE,
+    ),
+]
+
+
+def _extract_date_phrase(raw: str) -> str | None:
+    """Deterministic pre-pass: find a date/time phrase in raw before the LLM call.
+    First match wins (patterns ordered most-specific first).
+    """
+    for pat in _DATE_PREPASS_RE:
+        m = pat.search(raw)
+        if m:
+            return m.group(0).strip()
+    return None
+
 
 def _make_ist_dt(d: object, time_str: str | None) -> tuple[datetime, bool]:
     """Build an IST datetime from a date object and optional time string.
@@ -334,23 +390,31 @@ def _resolve_date_phrase(phrase: str | None, captured_at: datetime) -> tuple[dat
     p_l = p.lower()
     cap = captured_at if captured_at.tzinfo else captured_at.replace(tzinfo=_IST)
 
-    # today
-    if p_l == "today":
-        return _make_ist_dt(cap.date(), None)
+    # today [at <time>]
+    if p_l.startswith("today"):
+        time_part = re.sub(r'^today\s*(?:at\s*)?', '', p_l).strip() or None
+        return _make_ist_dt(cap.date(), time_part)
 
     # tonight
     if p_l == "tonight":
         return datetime(cap.year, cap.month, cap.day, 20, 0, 0, tzinfo=_IST), False
+
+    # day after tomorrow [at <time>]
+    if re.match(r'^day\s+after\s+tomorrow', p_l):
+        time_part = re.sub(r'^day\s+after\s+tomorrow\s*(?:at\s*)?', '', p_l).strip() or None
+        return _make_ist_dt((cap + timedelta(days=2)).date(), time_part)
 
     # tomorrow [at <time>]
     if re.match(r'^tomorrow|^tmr(?:w)?$|^tom$', p_l):
         time_part = re.sub(r'^tomorrow\s*(?:at\s*)?', '', p_l).strip() or None
         return _make_ist_dt((cap + timedelta(days=1)).date(), time_part)
 
-    # in N days
-    m = re.match(r'^in\s+(\d+)\s+days?$', p_l)
+    # in N days / in N weeks
+    m = re.match(r'^in\s+(\d+)\s+(days?|weeks?)$', p_l)
     if m:
-        return _make_ist_dt((cap + timedelta(days=int(m.group(1)))).date(), None)
+        n = int(m.group(1))
+        delta = timedelta(weeks=n) if m.group(2).startswith('week') else timedelta(days=n)
+        return _make_ist_dt((cap + delta).date(), None)
 
     # (next|this) <weekday> [at <time>]
     wd_m = _WEEKDAY_RE.match(p_l)

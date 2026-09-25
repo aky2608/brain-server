@@ -927,7 +927,7 @@ async def get_planner_counts():
 
 @app.get("/planner", dependencies=[Depends(verify_api_key)])
 async def get_planner(bucket: Optional[str] = None):
-    _PLANNER_COLS = "id,raw_content,title,ai_summary,category,subcategory,action_class,task_status,task_progress,task_deadline,plan_order,rollover_note,plan_bucket,plan_date,status,created_at"
+    _PLANNER_COLS = "id,raw_content,title,ai_summary,category,subcategory,action_class,task_status,task_progress,task_deadline,plan_order,rollover_note,plan_bucket,plan_date,status,created_at,starts_at,is_event,time_inferred"
     query = supabase.table("items").select(_PLANNER_COLS)
     if bucket:
         query = query.eq("plan_bucket", bucket)

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -136,6 +137,39 @@ def _log_route(
         logger.exception("agent_decisions write failed")
 
 
+def _capture_fragments(fragments: list[str]) -> int:
+    """
+    Insert one items row + one job_queue row per fragment.
+    source='slash_plan' is identifiable in trails.
+    Returns count of successfully inserted items.
+    """
+    url = _db_url()
+    if not url:
+        return 0
+    inserted = 0
+    try:
+        with psycopg.connect(url) as conn:
+            for fragment in fragments:
+                row = conn.execute(
+                    """INSERT INTO items (raw_content, source, capture_type, classification_status)
+                       VALUES (%s, 'slash_plan', 'text', 'instant')
+                       RETURNING id""",
+                    (fragment,),
+                ).fetchone()
+                if not row:
+                    continue
+                item_id = str(row[0])
+                conn.execute(
+                    "INSERT INTO job_queue (job_type, payload) VALUES ('graph_invoke', %s)",
+                    (json.dumps({"item_id": item_id, "content": fragment, "source": "slash_plan"}),),
+                )
+                inserted += 1
+            conn.commit()
+    except Exception:
+        logger.exception("_capture_fragments: DB error inserting %d fragments", len(fragments))
+    return inserted
+
+
 def personal_agent_node(state: GraphState) -> dict:
     """
     Sole entry point. Two modes:
@@ -244,6 +278,22 @@ def personal_agent_node(state: GraphState) -> dict:
         return {"routed_to": "echo"}
 
     if alias is not None:
+        # /plan <text> → split on commas, capture each fragment, then schedule as normal.
+        # /plan alone (no remainder) falls through unchanged.
+        if alias == "plan":
+            remainder = raw.strip()[len("/plan"):].strip()
+            if remainder:
+                fragments = [f.strip() for f in remainder.split(",") if f.strip()][:10]
+                if fragments:
+                    n = _capture_fragments(fragments)
+                    names = ", ".join(f'"{f}"' for f in fragments)
+                    _log_decision(
+                        "personal_agent",
+                        "slash_plan_capture",
+                        f"captured {n}/{len(fragments)} fragment(s) from /plan: {names}",
+                        item_id=item_id,
+                    )
+
         shortcut = lookup_shortcut(alias)
         if shortcut:
             routing_key = shortcut["agent"] or "echo"
