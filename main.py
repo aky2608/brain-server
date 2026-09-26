@@ -633,7 +633,6 @@ async def outbox_delivery_loop() -> None:
                             payload: dict = {
                                 "chat_id": int(row["recipient"]),
                                 "text": row["message"],
-                                "parse_mode": "Markdown",
                             }
                             if row.get("reply_markup"):
                                 payload["reply_markup"] = row["reply_markup"]
@@ -641,7 +640,8 @@ async def outbox_delivery_loop() -> None:
                                 f"{tg_base}/sendMessage",
                                 json=payload,
                             )
-                            r.raise_for_status()
+                            if not r.is_success:
+                                raise ValueError(f"telegram {r.status_code}: {r.text[:200]}")
                         _mark_outbox_sent(row["id"])
                         logger.info("outbox sent", extra={"ctx": {"outbox_id": row["id"],
                                                                    "channel": row["channel"]}})

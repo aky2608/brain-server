@@ -7,8 +7,8 @@ respecting the per-rule cooldown (last_notified_at + cooldown_hours).
 ADHD invariants enforced:
   - Escalate friction, never lock: tiers route to morning_brief or log_only by
     default; only interview_prep fires 'always'.
-  - A completed drill clears its missed-counter — a stale gate_missed rule MUST
-    NOT fire after the drill was done. Clear check runs before threshold check.
+  - A completed drill resets the tasks missed-counter, but absence-of-practice
+    still fires independently — one session does not satisfy min_required.
   - Interrupts are cooldown-gated so one unresolved condition cannot spam.
 
 Decisions are returned for PersonalAgent to write to agent_decisions
@@ -24,6 +24,10 @@ import psycopg
 from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowModel
 
 logger = logging.getLogger("brain")
+
+
+def _tg_chat_id() -> str:
+    return os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 class WatchInput(NarrowModel):
@@ -90,10 +94,27 @@ class WatchAgent(BaseAgent):
                     if decision:
                         fired.append(rule["rule_type"])
                         decisions.append(decision)
+                        # Atomic with outbox write below — last_notified_at is never
+                        # stamped without the message being queued.
                         conn.execute(
                             "UPDATE agent_watch_rules SET last_notified_at = now() WHERE id = %s",
                             (rule["id"],),
                         )
+                        tier = decision["interrupt_tier"]
+                        if tier == "always":
+                            chat_id = _tg_chat_id()
+                            if chat_id:
+                                conn.execute(
+                                    "INSERT INTO outbox (channel, recipient, message)"
+                                    " VALUES ('telegram', %s, %s)",
+                                    (chat_id, f"\u26a0\ufe0f {rule['rule_type']}: {decision['reason']}"),
+                                )
+                            else:
+                                logger.warning("watch_agent: TELEGRAM_CHAT_ID not set; skipping outbox for %s", rule["rule_type"])
+                        # morning_brief: no 6:30am delivery mechanism exists yet —
+                        # intentionally unbuilt, not an oversight. reminder_snoozed,
+                        # missed_charge, and non-escalated gate_missed all land here.
+                        # log_only: no message by design.
 
                 conn.commit()
 
@@ -149,21 +170,29 @@ def _decision(action_taken: str, reason: str, interrupt_tier: str) -> dict:
 
 def _eval_gate_missed(conn: psycopg.Connection, rule: dict) -> Optional[dict]:
     """
-    Count undone GATE drill tasks in the rolling window.
+    Fires if undone GATE tasks OR absent practice in the rolling window.
 
-    Clear-check runs FIRST: if any GATE drill was completed after last_cleared_at,
-    reset missed_count and return None — the nag must respect completed work.
-    Threshold check only runs if no recent completion found.
+    Clear-check resets missed_count (tasks counter) when any verified session or
+    revision review falls within the relevant window, but does NOT suppress the
+    absence condition. A single completed session resets the tasks counter yet can
+    still leave sessions_in_window below min_required — that nag is intentional.
+    The old "clear check → return None" invariant applied when this rule only
+    tracked undone tasks; it does not hold for the absence condition.
+
+    Conditions (fire on either):
+      undone_tasks  — active gate-tagged items not done, count >= threshold_warn
+                      escalates to 'always' at threshold_escalate
+      absence       — verified drill_sessions in window < min_required (default 3)
+                      escalates to 'always' when gap since last session > 2 * window_days
+
+    One rule row covers both conditions; they share a single cooldown.
     """
     cond = rule.get("condition") or {}
     threshold_warn = int(cond.get("threshold_warn", 3))
     threshold_escalate = int(cond.get("threshold_escalate", 5))
     window_days = int(cond.get("window_days", 7))
+    min_required = int(cond.get("min_required", 3))
 
-    # Combined clear-check: a verified drill_sessions row OR a revision_reviews row
-    # on a gate_subject notebook, either dated after last_cleared_at.
-    # notebook_type = 'gate_subject' covers all present and future GATE notebooks
-    # automatically — no name list to maintain.
     last_cleared = rule.get("last_cleared_at")
     if last_cleared:
         cleared = conn.execute(
@@ -182,16 +211,21 @@ def _eval_gate_missed(conn: psycopg.Connection, rule: dict) -> Optional[dict]:
             (last_cleared, last_cleared),
         ).fetchone()[0]
     else:
+        # Bound to window start — without this, any historical session sets
+        # cleared=True and the rule can never fire on a fresh install.
         cleared = conn.execute(
-            """SELECT EXISTS (
-                   SELECT 1 FROM drill_sessions WHERE verified = true
+            f"""SELECT EXISTS (
+                   SELECT 1 FROM drill_sessions
+                   WHERE verified = true
+                     AND created_at > now() - interval '{window_days} days'
 
                    UNION ALL
 
                    SELECT 1 FROM revision_reviews rr
                    JOIN revision_questions rq ON rq.id = rr.question_id
                    JOIN notebooks nb ON nb.id = rq.notebook_id
-                   WHERE nb.notebook_type = 'gate_subject'
+                   WHERE rr.reviewed_at > now() - interval '{window_days} days'
+                     AND nb.notebook_type = 'gate_subject'
                    LIMIT 1
                )""",
         ).fetchone()[0]
@@ -201,7 +235,12 @@ def _eval_gate_missed(conn: psycopg.Connection, rule: dict) -> Optional[dict]:
             "UPDATE agent_watch_rules SET missed_count = 0, last_cleared_at = now() WHERE id = %s",
             (rule["id"],),
         )
-        return None
+
+    sessions_in_window = conn.execute(
+        f"""SELECT COUNT(*) FROM drill_sessions
+            WHERE verified = true
+              AND created_at > now() - interval '{window_days} days'""",
+    ).fetchone()[0]
 
     missed = conn.execute(
         f"""SELECT COUNT(*) FROM items
@@ -212,21 +251,46 @@ def _eval_gate_missed(conn: psycopg.Connection, rule: dict) -> Optional[dict]:
               AND created_at > now() - interval '{window_days} days'""",
     ).fetchone()[0]
 
-    conn.execute(
-        "UPDATE agent_watch_rules SET missed_count = %s WHERE id = %s",
-        (missed, rule["id"]),
-    )
+    if not cleared:
+        conn.execute(
+            "UPDATE agent_watch_rules SET missed_count = %s WHERE id = %s",
+            (missed, rule["id"]),
+        )
 
-    if missed < threshold_warn:
+    tasks_fire = missed >= threshold_warn
+    absence_fire = sessions_in_window < min_required
+
+    if not (tasks_fire or absence_fire):
         return None
 
     if not _cooldown_elapsed(rule):
         return None
 
-    tier = "always" if missed >= threshold_escalate else rule["interrupt_tier"]
+    parts: list[str] = []
+    tiers: list[str] = []
+
+    if tasks_fire:
+        tiers.append("always" if missed >= threshold_escalate else rule["interrupt_tier"])
+        parts.append(f"{missed} undone tasks (warn≥{threshold_warn})")
+
+    if absence_fire:
+        last_row = conn.execute(
+            "SELECT MAX(created_at) FROM drill_sessions WHERE verified = true",
+        ).fetchone()
+        last_session_at = last_row[0] if last_row else None
+        if last_session_at is None:
+            gap_days = 2 * window_days + 1
+        else:
+            if last_session_at.tzinfo is None:
+                last_session_at = last_session_at.replace(tzinfo=timezone.utc)
+            gap_days = (datetime.now(timezone.utc) - last_session_at).days
+        tiers.append("always" if gap_days > 2 * window_days else "morning_brief")
+        parts.append(f"{sessions_in_window}/{min_required} sessions in {window_days}d (last {gap_days}d ago)")
+
+    tier = "always" if "always" in tiers else tiers[0]
     return _decision(
         action_taken="watch_gate_missed",
-        reason=f"GATE drills: {missed} undone in rolling {window_days}d (warn≥{threshold_warn}, escalate≥{threshold_escalate})",
+        reason=f"GATE: {'; '.join(parts)}",
         interrupt_tier=tier,
     )
 
