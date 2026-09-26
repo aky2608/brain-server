@@ -89,6 +89,7 @@ class RevisionOutput(NarrowModel):
     action: str  # "generated" | "showed" | "graded" | "skipped" | "empty" | "error"
     message: str
     decisions: list[dict] = []
+    outbox_written: bool = False  # set True by paths that already wrote to outbox
 
 
 def _db_url() -> str:
@@ -112,33 +113,56 @@ class RevisionAgent(BaseAgent):
 
     def handle(self, input: RevisionInput) -> RevisionOutput:
         raw = input.raw_input.strip()
+        chat_id = self._get_chat_id(input.item_id)
 
         drill_match = re.match(r"^/drill\s+(\S+)(.*)", raw, flags=re.IGNORECASE)
         if drill_match:
             subcmd = drill_match.group(1).lower()
             rest = drill_match.group(2).strip()
-            chat_id = self._get_chat_id(input.item_id)
             if subcmd == "start":
-                return self._handle_drill_start(rest, chat_id)
-            if subcmd == "answer":
-                return self._handle_drill_answer(rest, chat_id)
-            if subcmd == "submit":
-                return self._handle_drill_submit(chat_id)
-            return RevisionOutput(action="error", message=f"Unknown drill subcommand: {subcmd!r}")
+                result = self._handle_drill_start(rest, chat_id)
+            elif subcmd == "answer":
+                result = self._handle_drill_answer(rest, chat_id)
+            elif subcmd == "submit":
+                result = self._handle_drill_submit(chat_id)
+            else:
+                result = RevisionOutput(action="error", message=f"Unknown drill subcommand: {subcmd!r}")
+        else:
+            after_slash = re.sub(r"^/revise\s*", "", raw, flags=re.IGNORECASE).strip()
+            lower = after_slash.lower()
+            if lower.startswith("generate"):
+                subject_hint = after_slash[len("generate"):].strip()
+                result = self._handle_generate(subject_hint, chat_id)
+            elif lower.startswith("answer"):
+                user_answer = after_slash[len("answer"):].strip()
+                result = self._handle_answer(user_answer, chat_id)
+            elif lower == "skip":
+                result = self._handle_skip(chat_id)
+            else:
+                result = self._handle_show(chat_id)
 
-        after_slash = re.sub(r"^/revise\s*", "", raw, flags=re.IGNORECASE).strip()
-        chat_id = self._get_chat_id(input.item_id)
+        if not result.outbox_written and result.message and chat_id:
+            # Separate connection: error/empty messages have no state to keep
+            # consistent with the sub-method's transaction, so committing
+            # independently is acceptable here.
+            url = _db_url()
+            if url:
+                try:
+                    with psycopg.connect(url) as conn:
+                        self._write_outbox(conn, chat_id, result.message)
+                        conn.commit()
+                except Exception:
+                    logger.exception("handle: fallback outbox write failed action=%s", result.action)
 
-        lower = after_slash.lower()
-        if lower.startswith("generate"):
-            subject_hint = after_slash[len("generate"):].strip()
-            return self._handle_generate(subject_hint, chat_id)
-        if lower.startswith("answer"):
-            user_answer = after_slash[len("answer"):].strip()
-            return self._handle_answer(user_answer, chat_id)
-        if lower == "skip":
-            return self._handle_skip(chat_id)
-        return self._handle_show(chat_id)
+        if result.action in ("error", "empty") and not result.decisions:
+            result = result.model_copy(update={"decisions": [{
+                "agent_name": "revision_agent",
+                "action_taken": result.action,
+                "reason": result.message,
+                "interrupt_tier": "log_only",
+            }]})
+
+        return result
 
     # ------------------------------------------------------------------
 
@@ -199,7 +223,7 @@ class RevisionAgent(BaseAgent):
         try:
             with psycopg.connect(url) as conn:
                 nb_row = conn.execute(
-                    "SELECT id FROM notebooks WHERE name = %s AND archived_at IS NULL LIMIT 1",
+                    "SELECT id FROM notebooks WHERE name ILIKE %s AND archived_at IS NULL LIMIT 1",
                     (notebook_name,),
                 ).fetchone()
                 if nb_row is None:
@@ -234,7 +258,7 @@ class RevisionAgent(BaseAgent):
                         conn.commit()
                 except Exception:
                     logger.exception("generate: outbox write failed (empty)")
-            return RevisionOutput(action="empty", message=msg, decisions=[{
+            return RevisionOutput(action="empty", message=msg, outbox_written=True, decisions=[{
                 "agent_name": "revision_agent", "action_taken": "generate:empty",
                 "reason": f"no uncovered items in notebook={notebook_name}", "interrupt_tier": "log_only",
             }])
@@ -280,7 +304,7 @@ class RevisionAgent(BaseAgent):
             logger.exception("generate: write transaction failed")
             return RevisionOutput(action="error", message=f"DB write failed: {exc}")
 
-        return RevisionOutput(action="generated", message=msg, decisions=[{
+        return RevisionOutput(action="generated", message=msg, outbox_written=True, decisions=[{
             "agent_name": "revision_agent", "action_taken": f"generate:generated:{len(questions)}",
             "reason": f"{len(questions)} questions written for notebook={notebook_name}", "interrupt_tier": "log_only",
         }])
@@ -311,7 +335,7 @@ class RevisionAgent(BaseAgent):
             return RevisionOutput(action="error", message=f"DB error: {exc}")
 
         action = "empty" if question is None else "showed"
-        return RevisionOutput(action=action, message=msg, decisions=[{
+        return RevisionOutput(action=action, message=msg, outbox_written=True, decisions=[{
             "agent_name": "revision_agent",
             "action_taken": "show:empty" if question is None else f"show:showed:q={question[0]}",
             "reason": "no questions due" if question is None else f"showed question id={question[0]}",
@@ -342,7 +366,7 @@ class RevisionAgent(BaseAgent):
                         conn.commit()
                 except Exception:
                     logger.exception("answer: outbox write failed (empty)")
-            return RevisionOutput(action="empty", message=msg, decisions=[{
+            return RevisionOutput(action="empty", message=msg, outbox_written=True, decisions=[{
                 "agent_name": "revision_agent", "action_taken": "answer:empty",
                 "reason": "no questions due", "interrupt_tier": "log_only",
             }])
@@ -394,7 +418,7 @@ class RevisionAgent(BaseAgent):
             logger.exception("answer: write transaction failed")
             return RevisionOutput(action="error", message=f"DB write failed: {exc}")
 
-        return RevisionOutput(action="graded", message=msg, decisions=[{
+        return RevisionOutput(action="graded", message=msg, outbox_written=True, decisions=[{
             "agent_name": "revision_agent",
             "action_taken": f"graded:score={score}:interval={interval_after}d",
             "reason": f"q_id={q_id} score={score}/10 next_review in {interval_after}d",
@@ -422,7 +446,7 @@ class RevisionAgent(BaseAgent):
                         conn.commit()
                 except Exception:
                     logger.exception("skip: outbox write failed (empty)")
-            return RevisionOutput(action="empty", message=msg, decisions=[{
+            return RevisionOutput(action="empty", message=msg, outbox_written=True, decisions=[{
                 "agent_name": "revision_agent", "action_taken": "skip:empty",
                 "reason": "no questions due", "interrupt_tier": "log_only",
             }])
@@ -447,7 +471,7 @@ class RevisionAgent(BaseAgent):
             logger.exception("skip: write transaction failed")
             return RevisionOutput(action="error", message=f"DB write failed: {exc}")
 
-        return RevisionOutput(action="skipped", message=msg, decisions=[{
+        return RevisionOutput(action="skipped", message=msg, outbox_written=True, decisions=[{
             "agent_name": "revision_agent", "action_taken": f"skipped:q={q_id}",
             "reason": "deferred by 1 day", "interrupt_tier": "log_only",
         }])
@@ -481,7 +505,7 @@ class RevisionAgent(BaseAgent):
                     )
 
                 nb_row = conn.execute(
-                    "SELECT id FROM notebooks WHERE name = %s AND notebook_type = 'gate_subject' "
+                    "SELECT id FROM notebooks WHERE name ILIKE %s AND notebook_type = 'gate_subject' "
                     "AND archived_at IS NULL LIMIT 1",
                     (notebook_name,),
                 ).fetchone()
@@ -529,7 +553,7 @@ class RevisionAgent(BaseAgent):
             logger.exception("drill_start: failed")
             return RevisionOutput(action="error", message=f"DB error: {exc}")
 
-        return RevisionOutput(action="drill_started", message=msg, decisions=[{
+        return RevisionOutput(action="drill_started", message=msg, outbox_written=True, decisions=[{
             "agent_name": "revision_agent",
             "action_taken": f"drill:started:sess={sess_id}:{len(questions)}q",
             "reason": f"notebook={notebook_name} {len(questions)} questions queued",
@@ -597,7 +621,7 @@ class RevisionAgent(BaseAgent):
             logger.exception("drill_answer: failed")
             return RevisionOutput(action="error", message=f"DB error: {exc}")
 
-        return RevisionOutput(action="drill_answered", message=msg, decisions=[{
+        return RevisionOutput(action="drill_answered", message=msg, outbox_written=True, decisions=[{
             "agent_name": "revision_agent",
             "action_taken": f"drill:answered:pos={position}",
             "reason": f"sess={sess_id} position {position}/{questions_total} answered",
@@ -660,7 +684,7 @@ class RevisionAgent(BaseAgent):
                     if chat_id:
                         self._write_outbox(conn, chat_id, msg)
                     conn.commit()
-                    return RevisionOutput(action="rejected", message=msg, decisions=[{
+                    return RevisionOutput(action="rejected", message=msg, outbox_written=True, decisions=[{
                         "agent_name": "revision_agent",
                         "action_taken": f"drill:rejected:{questions_answered}of{questions_total}",
                         "reason": reason, "interrupt_tier": "log_only",
@@ -725,7 +749,7 @@ class RevisionAgent(BaseAgent):
             logger.exception("drill_submit: failed")
             return RevisionOutput(action="error", message=f"DB error: {exc}")
 
-        return RevisionOutput(action="drill_submitted", message=msg, decisions=[{
+        return RevisionOutput(action="drill_submitted", message=msg, outbox_written=True, decisions=[{
             "agent_name": "revision_agent",
             "action_taken": f"drill:submitted:score={score_avg}:{'flagged_fast' if flag_fast else 'ok'}",
             "reason": reason, "interrupt_tier": "log_only",
