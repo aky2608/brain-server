@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Brain morning brief at 06:35 IST daily
+
+[Timer]
+OnCalendar=*-*-* 06:35:00 Asia/Kolkata
+Persistent=true
+Unit=brain-brief.service
+
+[Install]
+WantedBy=timers.target

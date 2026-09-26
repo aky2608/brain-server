@@ -1,0 +1,14 @@
+[Unit]
+Description=Brain morning brief
+After=network.target
+OnFailure=brain-scheduler-notify.service
+
+[Service]
+Type=oneshot
+User=ashish
+WorkingDirectory=/opt/brain
+EnvironmentFile=/opt/brain/.env
+ExecStart=/opt/brain/venv/bin/python /opt/brain/brief.py
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=brain-brief

@@ -67,7 +67,9 @@
       "Read(//var/www/brain/**)",
       "Read(//opt/brain-infra/www/**)",
       "Bash(sudo grep *)",
-      "Bash(sudo ls *)"
+      "Bash(sudo ls *)",
+      "Bash(pg_dump -s)",
+      "Bash(psql -c \"\\\\d items\")"
     ]
   }
 }
