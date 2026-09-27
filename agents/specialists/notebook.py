@@ -70,7 +70,7 @@ def _resolve_subject(hint: str) -> Optional[str]:
 
 def _notebook_id_by_name(conn: psycopg.Connection, name: str, notebook_type: str) -> Optional[int]:
     row = conn.execute(
-        "SELECT id FROM notebooks WHERE name = %s AND notebook_type = %s",
+        "SELECT id FROM notebooks WHERE name ILIKE %s AND notebook_type = %s",
         (name, notebook_type),
     ).fetchone()
     return row[0] if row else None

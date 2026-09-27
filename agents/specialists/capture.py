@@ -148,6 +148,83 @@ class CaptureAgent(BaseAgent):
                 shadow=True,
             )
 
+        # Check if this item belongs to a notebook — classification was already written
+        # deterministically by the capture endpoint; skip the LLM classify call.
+        url = os.environ.get("BRAIN_DB_URL", "")
+        is_notebook_item = False
+        if url:
+            try:
+                with psycopg.connect(url) as _chk:
+                    row = _chk.execute(
+                        "SELECT notebook_id FROM items WHERE id = %s",
+                        (input.capture_uuid,),
+                    ).fetchone()
+                    is_notebook_item = bool(row and row[0])
+            except Exception:
+                pass  # on failure, fall through to normal classify
+
+        if is_notebook_item:
+            vector = _embed(input.raw)
+            decisions: list[dict] = [{
+                "agent_name": "capture_agent",
+                "action_taken": "classified:learning/notebook",
+                "reason": "notebook capture — deterministic, no LLM call",
+                "interrupt_tier": "log_only",
+            }]
+
+            if SHADOW_MODE:
+                return CaptureOutput(
+                    item_id=input.capture_uuid,
+                    category="learning",
+                    shadow=True,
+                    decisions=decisions,
+                )
+
+            embedding_stored = False
+            wikilink_count = 0
+            embedding_link_count = 0
+            if url:
+                try:
+                    with psycopg.connect(url) as conn:
+                        conn.execute(
+                            "UPDATE items SET classification_status = 'done' WHERE id = %s",
+                            (input.capture_uuid,),
+                        )
+                        if vector:
+                            _store_embedding(input.capture_uuid, vector, conn)
+                            embedding_stored = True
+                        wikilink_count = _link_wikilinks(input.capture_uuid, input.raw, conn)
+                        if vector:
+                            embedding_link_count = _link_embeddings(
+                                input.capture_uuid, vector, conn
+                            )
+                        conn.commit()
+                except Exception:
+                    logger.exception(
+                        "capture_agent notebook write failed",
+                        extra={"ctx": {"item_id": input.capture_uuid}},
+                    )
+            decisions.append({
+                "agent_name": "capture_agent",
+                "action_taken": "embedded" if embedding_stored else "embed:skipped",
+                "reason": f"model={_EMBED_MODEL}" if embedding_stored else "no vector returned",
+                "interrupt_tier": "log_only",
+            })
+            decisions.append({
+                "agent_name": "capture_agent",
+                "action_taken": f"linked:wikilink={wikilink_count},embedding={embedding_link_count}",
+                "reason": f"{wikilink_count} wikilink(s), {embedding_link_count} embedding link(s) created",
+                "interrupt_tier": "log_only",
+            })
+            return CaptureOutput(
+                item_id=input.capture_uuid,
+                category="learning",
+                shadow=False,
+                embedding_stored=embedding_stored,
+                links_created=wikilink_count + embedding_link_count,
+                decisions=decisions,
+            )
+
         cls = _classify(input.raw, input.source, input.capture_type)
 
         # Regex pre-pass: deterministic extraction wins; LLM date_phrase is the fallback.
@@ -204,7 +281,6 @@ class CaptureAgent(BaseAgent):
         embedding_stored = False
         wikilink_count = 0
         embedding_link_count = 0
-        url = os.environ.get("BRAIN_DB_URL", "")
         if url:
             try:
                 captured_at = datetime.now(_IST)

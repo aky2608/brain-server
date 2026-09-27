@@ -120,6 +120,8 @@ class CaptureInput(BaseModel):
     metadata: Optional[dict] = {}
     category: Optional[str] = None
     title: Optional[str] = None
+    notebook_id: Optional[int] = None
+    section_id: Optional[int] = None
 
 
 async def call_1minai(prompt: str, model: str = ONEMIN_MODEL) -> str:
@@ -824,11 +826,40 @@ async def capture(data: CaptureInput):
         insert_payload["category"] = shortcut["category"]
     if data.title:
         insert_payload["title"] = data.title
+    if data.notebook_id:
+        insert_payload["notebook_id"] = data.notebook_id
+    if data.section_id:
+        insert_payload["section_id"] = data.section_id
     result = supabase.table("items").insert(insert_payload).execute()
 
     item_id = result.data[0]["id"]
 
-    if shortcut or is_active:
+    if data.notebook_id:
+        try:
+            with _db_conn() as conn:
+                nb_row = conn.execute(
+                    "SELECT name FROM notebooks WHERE id = %s", (data.notebook_id,)
+                ).fetchone()
+                sec_row = (
+                    conn.execute(
+                        "SELECT name FROM sections WHERE id = %s", (data.section_id,)
+                    ).fetchone()
+                    if data.section_id
+                    else None
+                )
+                tags = ["notebook", nb_row[0].lower()] if nb_row else ["notebook"]
+                if sec_row:
+                    tags.append(sec_row[0].lower())
+                conn.execute(
+                    "UPDATE items SET category = 'learning', ai_tags = %s::jsonb,"
+                    " classification_status = 'shortcut' WHERE id = %s",
+                    (json.dumps(tags), item_id),
+                )
+                conn.commit()
+        except Exception as e:
+            print(f"[capture] notebook tag write failed: {e}")
+
+    if shortcut or is_active or data.notebook_id:
         _enqueue_graph_invoke(item_id, content, data.source)
 
     path = "shortcut" if shortcut else ("instant" if is_active else "queued")
@@ -874,7 +905,8 @@ async def update_item(item_id: str, updates: dict):
     allowed = {"category", "subcategory", "ai_tags", "task_status",
                "task_deadline", "task_progress", "plan_bucket",
                "plan_order", "plan_date", "rollover_note",
-               "status", "reviewed", "raw_content", "ai_summary"}
+               "status", "reviewed", "raw_content", "ai_summary",
+               "section_id", "notebook_id"}
     filtered = {k: v for k, v in updates.items() if k in allowed}
     if not filtered:
         raise HTTPException(400, "No valid fields to update")
@@ -1830,25 +1862,241 @@ async def list_notebooks(
     include_archived: bool = False,
 ):
     with _db_conn() as conn:
-        wheres = [] if include_archived else ["archived_at IS NULL"]
+        wheres = [] if include_archived else ["n.archived_at IS NULL"]
         params: list = []
         if notebook_type:
-            wheres.append("notebook_type = %s")
+            wheres.append("n.notebook_type = %s")
             params.append(notebook_type)
         where_clause = ("WHERE " + " AND ".join(wheres)) if wheres else ""
         rows = conn.execute(
-            f"SELECT id, name, notebook_type, created_at, archived_at "
-            f"FROM notebooks {where_clause} ORDER BY notebook_type, name",
+            f"""SELECT n.id, n.name, n.notebook_type, n.created_at, n.archived_at,
+                       COALESCE(ic.item_count, 0),
+                       COALESCE(qc.question_count, 0),
+                       ic.last_filed_at
+                  FROM notebooks n
+                  LEFT JOIN (
+                      SELECT notebook_id,
+                             COUNT(*)       AS item_count,
+                             MAX(created_at) AS last_filed_at
+                        FROM items
+                       WHERE status != 'deleted' AND notebook_id IS NOT NULL
+                       GROUP BY notebook_id
+                  ) ic ON ic.notebook_id = n.id
+                  LEFT JOIN (
+                      SELECT notebook_id,
+                             COUNT(*) AS question_count
+                        FROM revision_questions
+                       WHERE archived_at IS NULL
+                       GROUP BY notebook_id
+                  ) qc ON qc.notebook_id = n.id
+                  {where_clause}
+                  ORDER BY n.notebook_type, n.name""",
             params,
         ).fetchall()
     return {
         "notebooks": [
             {
-                "id": r[0], "name": r[1], "notebook_type": r[2],
-                "created_at": r[3].isoformat(), "archived_at": r[4],
+                "id":            r[0],
+                "name":          r[1],
+                "notebook_type": r[2],
+                "created_at":    r[3].isoformat(),
+                "archived_at":   r[4].isoformat() if r[4] else None,
+                "item_count":    r[5],
+                "question_count": r[6],
+                "last_filed_at": r[7].isoformat() if r[7] else None,
             }
             for r in rows
         ]
+    }
+
+
+@app.get("/notebooks/{notebook_id}/items", dependencies=[Depends(verify_api_key)])
+async def get_notebook_items(
+    notebook_id: int,
+    limit: int = 50,
+    offset: int = 0,
+    unsectioned: bool = False,
+):
+    section_filter = " AND section_id IS NULL" if unsectioned else ""
+    with _db_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT id, title, raw_content, ai_summary, category, created_at
+                  FROM items
+                 WHERE notebook_id = %s
+                   AND status != 'deleted'
+                   {section_filter}
+                 ORDER BY created_at DESC
+                 LIMIT %s OFFSET %s""",
+            (notebook_id, limit, offset),
+        ).fetchall()
+        total_row = conn.execute(
+            f"SELECT COUNT(*) FROM items WHERE notebook_id = %s AND status != 'deleted'{section_filter}",
+            (notebook_id,),
+        ).fetchone()
+    return {
+        "items": [
+            {
+                "id":          str(r[0]),
+                "title":       r[1],
+                "raw_content": r[2],
+                "ai_summary":  r[3],
+                "category":    r[4],
+                "created_at":  r[5].isoformat() if r[5] else None,
+            }
+            for r in rows
+        ],
+        "total":  total_row[0] if total_row else 0,
+        "offset": offset,
+        "limit":  limit,
+    }
+
+
+@app.get("/notebooks/{notebook_id}/sections", dependencies=[Depends(verify_api_key)])
+async def get_notebook_sections(notebook_id: int, include_archived: bool = False):
+    with _db_conn() as conn:
+        archived_filter = "" if include_archived else "WHERE s.notebook_id = %s AND s.archived_at IS NULL"
+        rows = conn.execute(
+            f"""SELECT s.id, s.name, s.position, s.created_at, s.archived_at,
+                       COALESCE(ic.item_count, 0),
+                       COALESCE(qc.question_count, 0)
+                  FROM sections s
+                  LEFT JOIN (
+                      SELECT section_id, COUNT(*) AS item_count
+                        FROM items
+                       WHERE status != 'deleted' AND section_id IS NOT NULL
+                       GROUP BY section_id
+                  ) ic ON ic.section_id = s.id
+                  LEFT JOIN (
+                      SELECT section_id, COUNT(*) AS question_count
+                        FROM revision_questions
+                       WHERE archived_at IS NULL AND section_id IS NOT NULL
+                       GROUP BY section_id
+                  ) qc ON qc.section_id = s.id
+                  {archived_filter}
+                  ORDER BY s.position, s.name""",
+            (notebook_id,),
+        ).fetchall()
+        unsectioned_row = conn.execute(
+            "SELECT COUNT(*) FROM items WHERE notebook_id = %s AND section_id IS NULL AND status != 'deleted'",
+            (notebook_id,),
+        ).fetchone()
+    return {
+        "sections": [
+            {
+                "id":             r[0],
+                "name":           r[1],
+                "position":       r[2],
+                "created_at":     r[3].isoformat() if r[3] else None,
+                "archived_at":    r[4].isoformat() if r[4] else None,
+                "item_count":     r[5],
+                "question_count": r[6],
+            }
+            for r in rows
+        ],
+        "unsectioned_count": unsectioned_row[0] if unsectioned_row else 0,
+    }
+
+
+class SectionCreate(BaseModel):
+    name: str
+    position: int = 0
+
+
+class SectionUpdate(BaseModel):
+    name: Optional[str] = None
+    position: Optional[int] = None
+    archived: Optional[bool] = None
+
+
+@app.patch("/sections/{section_id}", dependencies=[Depends(verify_api_key)])
+async def update_section(section_id: int, data: SectionUpdate):
+    sets: list[str] = []
+    params: list = []
+    if data.name is not None:
+        name = data.name.strip()
+        if not name:
+            raise HTTPException(400, "name cannot be empty")
+        sets.append("name = %s")
+        params.append(name)
+    if data.position is not None:
+        sets.append("position = %s")
+        params.append(data.position)
+    if data.archived is not None:
+        sets.append("archived_at = NOW()" if data.archived else "archived_at = NULL")
+    if not sets:
+        raise HTTPException(400, "nothing to update")
+    params.append(section_id)
+    with _db_conn() as conn:
+        row = conn.execute(
+            f"UPDATE sections SET {', '.join(sets)} WHERE id = %s "
+            f"RETURNING id, name, position, archived_at",
+            params,
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "section not found")
+        conn.commit()
+    return {
+        "id":          row[0],
+        "name":        row[1],
+        "position":    row[2],
+        "archived_at": row[3].isoformat() if row[3] else None,
+    }
+
+
+@app.post("/notebooks/{notebook_id}/sections", dependencies=[Depends(verify_api_key)])
+async def create_section(notebook_id: int, data: SectionCreate):
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(400, "name is required")
+    with _db_conn() as conn:
+        row = conn.execute(
+            """INSERT INTO sections (notebook_id, name, position)
+               VALUES (%s, %s, %s)
+               ON CONFLICT ON CONSTRAINT uq_sections_notebook_name
+               DO UPDATE SET archived_at = NULL, position = EXCLUDED.position
+               RETURNING id, name, position, created_at""",
+            (notebook_id, name, data.position),
+        ).fetchone()
+        conn.commit()
+    return {
+        "id":         row[0],
+        "name":       row[1],
+        "position":   row[2],
+        "created_at": row[3].isoformat() if row[3] else None,
+    }
+
+
+@app.get("/sections/{section_id}/items", dependencies=[Depends(verify_api_key)])
+async def get_section_items(section_id: int, limit: int = 50, offset: int = 0):
+    with _db_conn() as conn:
+        rows = conn.execute(
+            """SELECT id, title, raw_content, ai_summary, category, created_at
+                 FROM items
+                WHERE section_id = %s
+                  AND status != 'deleted'
+                ORDER BY created_at DESC
+                LIMIT %s OFFSET %s""",
+            (section_id, limit, offset),
+        ).fetchall()
+        total_row = conn.execute(
+            "SELECT COUNT(*) FROM items WHERE section_id = %s AND status != 'deleted'",
+            (section_id,),
+        ).fetchone()
+    return {
+        "items": [
+            {
+                "id":          str(r[0]),
+                "title":       r[1],
+                "raw_content": r[2],
+                "ai_summary":  r[3],
+                "category":    r[4],
+                "created_at":  r[5].isoformat() if r[5] else None,
+            }
+            for r in rows
+        ],
+        "total":  total_row[0] if total_row else 0,
+        "offset": offset,
+        "limit":  limit,
     }
 
 
@@ -2125,6 +2373,35 @@ async def get_backlinks(item_id: str):
         for r in rows
     ]
     return {"item_id": item_id, "backlinks": backlinks, "count": len(backlinks)}
+
+
+@app.get("/items/{item_id}/forward-links", dependencies=[Depends(verify_api_key)])
+async def get_forward_links(item_id: str):
+    with _db_conn() as conn:
+        rows = conn.execute(
+            """SELECT i.id, i.title, i.category, i.ai_summary,
+                      tl.link_type, tl.wikilink_text, tl.similarity_score
+                 FROM thought_links tl
+                 JOIN items i ON i.id = tl.target_item_id
+                WHERE tl.source_item_id = %s
+                  AND i.status = 'active'
+                ORDER BY tl.created_at DESC""",
+            (item_id,),
+        ).fetchall()
+
+    links = [
+        {
+            "target_id":        str(r[0]),
+            "title":            r[1],
+            "category":         r[2],
+            "summary":          _summary_snippet(r[3]),
+            "link_type":        r[4],
+            "wikilink_text":    r[5],
+            "similarity_score": r[6],
+        }
+        for r in rows
+    ]
+    return {"item_id": item_id, "forward_links": links, "count": len(links)}
 
 
 @app.get("/items/{item_id}/unlinked-mentions", dependencies=[Depends(verify_api_key)])
