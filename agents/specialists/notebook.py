@@ -21,6 +21,12 @@ import psycopg
 from dotenv import load_dotenv
 
 from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowModel
+from agents.specialists.capture import (
+    _embed,
+    _link_embeddings,
+    _link_wikilinks,
+    _store_embedding,
+)
 
 load_dotenv()
 logger = logging.getLogger("brain")
@@ -121,17 +127,29 @@ class NotebookAgent(BaseAgent):
         if not url:
             return NotebookOutput(action="error", message="BRAIN_DB_URL not set")
 
+        # Read-only: resolve notebook_id before opening the write connection.
         try:
             with psycopg.connect(url) as conn:
                 notebook_id = _notebook_id_by_name(conn, notebook_name, "gate_subject")
-                if notebook_id is None:
-                    return NotebookOutput(
-                        action="error",
-                        message=f"Notebook {notebook_name!r} not found in DB — was it archived?",
-                    )
+        except Exception as exc:
+            logger.exception("notebook lookup failed item_id=%s", item_id)
+            return NotebookOutput(action="error", message=f"DB error: {exc}")
 
-                if item_id:
-                    clean_content = " ".join(tokens[1:])
+        if notebook_id is None:
+            return NotebookOutput(
+                action="error",
+                message=f"Notebook {notebook_name!r} not found in DB — was it archived?",
+            )
+
+        if item_id:
+            clean_content = " ".join(tokens[1:])
+
+            # Embed outside the write connection (network call to Gemini).
+            vector = _embed(clean_content)
+
+            # Item UPDATE + embedding + links commit atomically.
+            try:
+                with psycopg.connect(url) as conn:
                     conn.execute(
                         """UPDATE items
                               SET notebook_id = %s,
@@ -140,11 +158,14 @@ class NotebookAgent(BaseAgent):
                             WHERE id = %s""",
                         (notebook_id, clean_content, item_id),
                     )
+                    if vector:
+                        _store_embedding(item_id, vector, conn)
+                        _link_wikilinks(item_id, clean_content, conn)
+                        _link_embeddings(item_id, vector, conn)
                     conn.commit()
-
-        except Exception as exc:
-            logger.exception("notebook route failed item_id=%s", item_id)
-            return NotebookOutput(action="error", message=f"DB error: {exc}")
+            except Exception as exc:
+                logger.exception("notebook route failed item_id=%s", item_id)
+                return NotebookOutput(action="error", message=f"DB error: {exc}")
 
         content_preview = " ".join(tokens[1:])[:60] or "(no content)"
         return NotebookOutput(
