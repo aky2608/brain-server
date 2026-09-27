@@ -9,3 +9,4 @@ dummy.m4a
 *.bak.*
 .env*
 logs/
+.claude/settings.local.json
