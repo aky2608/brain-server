@@ -1193,6 +1193,58 @@ async def get_dashboard_summary():
             "SELECT COUNT(*) FROM notebooks WHERE archived_at IS NULL"
         ).fetchone()
 
+        # revision tile
+        rev_due_row = conn.execute(
+            "SELECT COUNT(*) FROM revision_questions WHERE next_review_date <= CURRENT_DATE AND archived_at IS NULL"
+        ).fetchone()
+        rev_total_row = conn.execute(
+            "SELECT COUNT(*) FROM revision_questions WHERE archived_at IS NULL"
+        ).fetchone()
+        rev_reviews_row = conn.execute(
+            "SELECT COUNT(*), AVG(score) FROM revision_reviews WHERE reviewed_at >= NOW() - INTERVAL '7 days'"
+        ).fetchone()
+        rev_by_notebook = conn.execute(
+            """SELECT n.name, COUNT(rq.id)
+                 FROM notebooks n
+                 JOIN revision_questions rq ON rq.notebook_id = n.id
+                WHERE rq.next_review_date <= CURRENT_DATE
+                  AND rq.archived_at IS NULL
+                  AND n.archived_at IS NULL
+                GROUP BY n.id, n.name
+                ORDER BY COUNT(rq.id) DESC"""
+        ).fetchall()
+
+        # finance tile
+        fin_month_row = conn.execute(
+            """SELECT COALESCE(SUM(amount) FILTER (WHERE direction = 'debit'), 0),
+                      COUNT(*) FILTER (WHERE direction = 'debit')
+                 FROM transactions
+                WHERE DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', CURRENT_DATE)"""
+        ).fetchone()
+        fin_by_cat = conn.execute(
+            """SELECT COALESCE(category, 'other'), SUM(amount)
+                 FROM transactions
+                WHERE DATE_TRUNC('month', transaction_date) = DATE_TRUNC('month', CURRENT_DATE)
+                  AND direction = 'debit'
+                GROUP BY category
+                ORDER BY SUM(amount) DESC"""
+        ).fetchall()
+        fin_upcoming = conn.execute(
+            """SELECT merchant, expected_amount, next_expected_date
+                 FROM recurrence_groups
+                WHERE status = 'active'
+                  AND next_expected_date >= CURRENT_DATE
+                  AND next_expected_date <= CURRENT_DATE + INTERVAL '30 days'
+                ORDER BY next_expected_date"""
+        ).fetchall()
+        fin_overdue = conn.execute(
+            """SELECT merchant, expected_amount, next_expected_date
+                 FROM recurrence_groups
+                WHERE status = 'active'
+                  AND next_expected_date < CURRENT_DATE
+                ORDER BY next_expected_date"""
+        ).fetchall()
+
     by_category = {(r[0] or "uncategorized"): r[1] for r in cat_rows}
 
     _g_last = gate_last_row[0].isoformat() if gate_last_row and gate_last_row[0] else None
@@ -1261,8 +1313,28 @@ async def get_dashboard_summary():
             "latest":          r_latest.data[0] if r_latest.data else None,
         },
         "gate":     gate_data,
-        "revision": None,
-        "finance":  None,
+        "revision": {
+            "due":         rev_due_row[0] if rev_due_row else 0,
+            "total":       rev_total_row[0] if rev_total_row else 0,
+            "reviews_7d":  int(rev_reviews_row[0]) if rev_reviews_row and rev_reviews_row[0] else 0,
+            "avg_score_7d": float(rev_reviews_row[1]) if rev_reviews_row and rev_reviews_row[1] is not None else None,
+            "by_notebook": [{"name": r[0], "due": r[1]} for r in rev_by_notebook],
+        },
+        "finance": {
+            "spent_month":    float(fin_month_row[0]) if fin_month_row else 0.0,
+            "tx_count_month": int(fin_month_row[1]) if fin_month_row else 0,
+            "by_category":    {r[0]: float(r[1]) for r in fin_by_cat},
+            "recurring_upcoming": [
+                {"merchant": r[0], "amount": float(r[1]) if r[1] is not None else None,
+                 "date": r[2].isoformat() if r[2] else None}
+                for r in fin_upcoming
+            ],
+            "recurring_overdue": [
+                {"merchant": r[0], "amount": float(r[1]) if r[1] is not None else None,
+                 "date": r[2].isoformat() if r[2] else None}
+                for r in fin_overdue
+            ],
+        },
         "people":   None,
         "system":   None,
     }

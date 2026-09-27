@@ -144,7 +144,7 @@ def _resolve_calendar_conflict(
                         (conflict_id,),
                     )
                     conn.execute(
-                        "UPDATE items SET starts_at=%s, time_inferred=%s WHERE id=%s",
+                        "UPDATE items SET starts_at=%s, time_inferred=%s, reminded_at=NULL WHERE id=%s",
                         (new_dt, new_inferred, new_item_id),
                     )
                     new_time_s = new_dt.astimezone(_IST).strftime("%-H:%M on %-d %b")
@@ -167,7 +167,7 @@ def _resolve_calendar_conflict(
                         (conflict_id,),
                     )
                     conn.execute(
-                        "UPDATE items SET starts_at=NULL, is_event=false, time_inferred=false WHERE id=%s",
+                        "UPDATE items SET starts_at=NULL, is_event=false, time_inferred=false, reminded_at=NULL WHERE id=%s",
                         (new_item_id,),
                     )
                     reply = "Unplanned \u2014 starts_at cleared. Reschedule when ready."

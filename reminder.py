@@ -49,10 +49,11 @@ def _format_eta(starts_at: datetime, now: datetime) -> str:
 
 
 def _build_message(name: str, starts_at: datetime, time_inferred: bool, now: datetime) -> str:
+    local = starts_at.astimezone(_IST)
+    time_s = local.strftime("%H:%M")
     if time_inferred:
-        local = starts_at.astimezone(_IST)
-        return f"\u23f0 {name} \u2014 today at {local.strftime('%H:%M')} (time approximate)"
-    return f"\u23f0 {name} \u2014 {_format_eta(starts_at, now)}"
+        return f"\u23f0 {time_s}  {name} \u2014 {_format_eta(starts_at, now)} (time approximate)"
+    return f"\u23f0 {time_s}  {name} \u2014 {_format_eta(starts_at, now)}"
 
 
 def main() -> None:
