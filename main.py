@@ -1852,6 +1852,119 @@ async def list_notebooks(
     }
 
 
+@app.get("/gate/overview", dependencies=[Depends(verify_api_key)])
+async def get_gate_overview():
+    with _db_conn() as conn:
+        gate_rule_row = conn.execute(
+            """SELECT (condition->>'min_required')::int,
+                      (condition->>'window_days')::int
+                 FROM agent_watch_rules
+                WHERE rule_type = 'gate_missed' AND enabled = true
+                LIMIT 1"""
+        ).fetchone()
+        target      = gate_rule_row[0] if gate_rule_row else 3
+        window_days = gate_rule_row[1] if gate_rule_row else 7
+
+        drills_row = conn.execute(
+            """SELECT COUNT(*)
+                 FROM drill_sessions
+                WHERE verified = true
+                  AND ended_at IS NOT NULL
+                  AND started_at >= NOW() - (%s * INTERVAL '1 day')""",
+            (window_days,),
+        ).fetchone()
+
+        nb_rows = conn.execute(
+            """SELECT
+                   n.id,
+                   n.name,
+                   COALESCE(qs.q_total, 0),
+                   COALESCE(qs.q_due,   0),
+                   COALESCE(qs.iv1,     0),
+                   COALESCE(qs.iv3,     0),
+                   COALESCE(qs.iv7,     0),
+                   COALESCE(qs.iv21,    0),
+                   rs.last_review,
+                   rs.avg_score_30d
+               FROM notebooks n
+               LEFT JOIN (
+                   SELECT notebook_id,
+                          COUNT(*)                                                    AS q_total,
+                          COUNT(*) FILTER (WHERE next_review_date <= CURRENT_DATE)   AS q_due,
+                          COUNT(*) FILTER (WHERE interval_days = 1)                  AS iv1,
+                          COUNT(*) FILTER (WHERE interval_days = 3)                  AS iv3,
+                          COUNT(*) FILTER (WHERE interval_days = 7)                  AS iv7,
+                          COUNT(*) FILTER (WHERE interval_days >= 21)                AS iv21
+                     FROM revision_questions
+                    WHERE archived_at IS NULL
+                    GROUP BY notebook_id
+               ) qs ON qs.notebook_id = n.id
+               LEFT JOIN (
+                   SELECT rq.notebook_id,
+                          MAX(rr.reviewed_at)                                         AS last_review,
+                          AVG(rr.score) FILTER (
+                              WHERE rr.reviewed_at >= NOW() - INTERVAL '30 days')     AS avg_score_30d
+                     FROM revision_reviews rr
+                     JOIN revision_questions rq ON rq.id = rr.question_id
+                    GROUP BY rq.notebook_id
+               ) rs ON rs.notebook_id = n.id
+              WHERE n.notebook_type = 'gate_subject'
+                AND n.archived_at IS NULL
+              ORDER BY COALESCE(qs.q_due, 0) DESC, n.name"""
+        ).fetchall()
+
+        ds_rows = conn.execute(
+            """SELECT ds.id,
+                      n.name           AS notebook_name,
+                      ds.started_at,
+                      ds.ended_at,
+                      ds.questions_total,
+                      ds.questions_answered,
+                      ds.elapsed_seconds,
+                      ds.score_avg,
+                      ds.verified,
+                      ds.reason
+                 FROM drill_sessions ds
+                 LEFT JOIN notebooks n ON n.id = ds.notebook_id
+                ORDER BY ds.started_at DESC
+                LIMIT 20"""
+        ).fetchall()
+
+    notebooks = [
+        {
+            "id":            r[0],
+            "name":          r[1],
+            "q_total":       r[2],
+            "q_due":         r[3],
+            "intervals":     {"1": r[4], "3": r[5], "7": r[6], "21": r[7]},
+            "last_review":   r[8].isoformat() if r[8] else None,
+            "avg_score_30d": float(r[9]) if r[9] is not None else None,
+        }
+        for r in nb_rows
+    ]
+    sessions = [
+        {
+            "id":                 r[0],
+            "notebook_name":      r[1],
+            "started_at":         r[2].isoformat() if r[2] else None,
+            "ended_at":           r[3].isoformat() if r[3] else None,
+            "questions_total":    r[4],
+            "questions_answered": r[5],
+            "elapsed_seconds":    r[6],
+            "score_avg":          float(r[7]) if r[7] is not None else None,
+            "verified":           r[8],
+            "reason":             r[9],
+        }
+        for r in ds_rows
+    ]
+    return {
+        "gate_rule": {"target": target, "window_days": window_days},
+        "drills_7d": drills_row[0] if drills_row else 0,
+        "notebooks": notebooks,
+        "sessions":  sessions,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Backlinks + graph endpoints (raw psycopg — thought_links requires joins
 # the Supabase client can't express)
