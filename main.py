@@ -1984,11 +1984,13 @@ async def get_notebook_sections(notebook_id: int, include_archived: bool = False
     with _db_conn() as conn:
         archived_filter = "" if include_archived else "WHERE s.notebook_id = %s AND s.archived_at IS NULL"
         rows = conn.execute(
-            f"""SELECT s.id, s.name, s.position, s.created_at, s.archived_at,
+            f"""SELECT s.id, s.name, s.position, s.created_at, s.archived_at, s.type,
                        COALESCE(ic.item_count, 0),
                        COALESCE(qc.question_count, 0),
                        COALESCE(ic.learned_count, 0),
-                       ss.summary
+                       ss.summary,
+                       COALESCE(qc.weak_count, 0),
+                       COALESCE(qc.has_reviews, FALSE)
                   FROM sections s
                   LEFT JOIN (
                       SELECT section_id,
@@ -1999,10 +2001,14 @@ async def get_notebook_sections(notebook_id: int, include_archived: bool = False
                        GROUP BY section_id
                   ) ic ON ic.section_id = s.id
                   LEFT JOIN (
-                      SELECT section_id, COUNT(*) AS question_count
-                        FROM revision_questions
-                       WHERE archived_at IS NULL AND section_id IS NOT NULL
-                       GROUP BY section_id
+                      SELECT rq.section_id,
+                             COUNT(DISTINCT rq.id)                                                           AS question_count,
+                             COUNT(DISTINCT rq.id) FILTER (WHERE rq.lapses >= 3 AND rq.interval_days <= 3)  AS weak_count,
+                             BOOL_OR(rr.id IS NOT NULL)                                                      AS has_reviews
+                        FROM revision_questions rq
+                        LEFT JOIN revision_reviews rr ON rr.question_id = rq.id
+                       WHERE rq.archived_at IS NULL AND rq.section_id IS NOT NULL
+                       GROUP BY rq.section_id
                   ) qc ON qc.section_id = s.id
                   LEFT JOIN LATERAL (
                       SELECT summary
@@ -2022,15 +2028,17 @@ async def get_notebook_sections(notebook_id: int, include_archived: bool = False
     return {
         "sections": [
             {
-                "id":             r[0],
-                "name":           r[1],
-                "position":       r[2],
-                "created_at":     r[3].isoformat() if r[3] else None,
-                "archived_at":    r[4].isoformat() if r[4] else None,
-                "item_count":     r[5],
-                "question_count": r[6],
-                "learned_count":  r[7],
-                "latest_summary": r[8],
+                "id":               r[0],
+                "name":             r[1],
+                "position":         r[2],
+                "created_at":       r[3].isoformat() if r[3] else None,
+                "archived_at":      r[4].isoformat() if r[4] else None,
+                "type":             r[5],
+                "item_count":       r[6],
+                "question_count":   r[7],
+                "learned_count":    r[8],
+                "latest_summary":   r[9],
+                "weakness_signal":  _weakness_signal(r[7], r[11], r[10]),
             }
             for r in rows
         ],
@@ -2081,6 +2089,56 @@ async def update_section(section_id: int, data: SectionUpdate):
         "name":        row[1],
         "position":    row[2],
         "archived_at": row[3].isoformat() if row[3] else None,
+    }
+
+
+@app.get("/sections/{section_id}/questions", dependencies=[Depends(verify_api_key)])
+async def get_section_questions(section_id: int):
+    """Return questions for a section with current SM state and last score.
+
+    Intended for drill-type section rendering: the client shows this list instead
+    of the item list shown for notes-type sections. Both endpoints remain callable
+    regardless of section type — type decides which is primary, not which exists.
+    """
+    with _db_conn() as conn:
+        sec_row = conn.execute(
+            "SELECT id, name, type FROM sections WHERE id = %s",
+            (section_id,),
+        ).fetchone()
+        if not sec_row:
+            raise HTTPException(404, "section not found")
+        rows = conn.execute(
+            """SELECT rq.id, rq.question, rq.expected_answer,
+                      rq.interval_days, rq.next_review_date, rq.lapses,
+                      last_r.score AS last_score
+                 FROM revision_questions rq
+                 LEFT JOIN LATERAL (
+                     SELECT score FROM revision_reviews
+                      WHERE question_id = rq.id
+                      ORDER BY reviewed_at DESC
+                      LIMIT 1
+                 ) last_r ON TRUE
+                WHERE rq.section_id = %s
+                  AND rq.archived_at IS NULL
+                ORDER BY rq.next_review_date ASC, rq.id ASC""",
+            (section_id,),
+        ).fetchall()
+    return {
+        "section_id":   sec_row[0],
+        "section_name": sec_row[1],
+        "section_type": sec_row[2],
+        "questions": [
+            {
+                "id":               r[0],
+                "question":         r[1],
+                "expected_answer":  r[2],
+                "interval_days":    r[3],
+                "next_review_date": r[4].isoformat() if r[4] else None,
+                "lapses":           r[5],
+                "last_score":       r[6],
+            }
+            for r in rows
+        ],
     }
 
 
@@ -2175,16 +2233,18 @@ async def get_gate_overview():
                    COALESCE(qs.iv7,     0),
                    COALESCE(qs.iv21,    0),
                    rs.last_review,
-                   rs.avg_score_30d
+                   rs.avg_score_30d,
+                   COALESCE(qs.weak_count, 0)
                FROM notebooks n
                LEFT JOIN (
                    SELECT notebook_id,
-                          COUNT(*)                                                    AS q_total,
-                          COUNT(*) FILTER (WHERE next_review_date <= CURRENT_DATE)   AS q_due,
-                          COUNT(*) FILTER (WHERE interval_days = 1)                  AS iv1,
-                          COUNT(*) FILTER (WHERE interval_days = 3)                  AS iv3,
-                          COUNT(*) FILTER (WHERE interval_days = 7)                  AS iv7,
-                          COUNT(*) FILTER (WHERE interval_days >= 21)                AS iv21
+                          COUNT(*)                                                          AS q_total,
+                          COUNT(*) FILTER (WHERE next_review_date <= CURRENT_DATE)         AS q_due,
+                          COUNT(*) FILTER (WHERE interval_days = 1)                        AS iv1,
+                          COUNT(*) FILTER (WHERE interval_days = 3)                        AS iv3,
+                          COUNT(*) FILTER (WHERE interval_days = 7)                        AS iv7,
+                          COUNT(*) FILTER (WHERE interval_days >= 21)                      AS iv21,
+                          COUNT(*) FILTER (WHERE lapses >= 3 AND interval_days <= 3)       AS weak_count
                      FROM revision_questions
                     WHERE archived_at IS NULL
                     GROUP BY notebook_id
@@ -2201,6 +2261,37 @@ async def get_gate_overview():
               WHERE n.notebook_type = 'gate_subject'
                 AND n.archived_at IS NULL
               ORDER BY COALESCE(qs.q_due, 0) DESC, n.name"""
+        ).fetchall()
+
+        sec_rows = conn.execute(
+            """SELECT s.id, s.name, s.type, s.notebook_id,
+                      COALESCE(qc.question_count, 0),
+                      COALESCE(qc.iv1,  0),
+                      COALESCE(qc.iv3,  0),
+                      COALESCE(qc.iv7,  0),
+                      COALESCE(qc.iv21, 0),
+                      COALESCE(qc.weak_count, 0),
+                      COALESCE(qc.has_reviews, FALSE)
+                 FROM sections s
+                 JOIN notebooks n ON n.id = s.notebook_id
+                 LEFT JOIN (
+                     SELECT rq.section_id,
+                            COUNT(DISTINCT rq.id)                                                           AS question_count,
+                            COUNT(DISTINCT rq.id) FILTER (WHERE rq.interval_days = 1)                      AS iv1,
+                            COUNT(DISTINCT rq.id) FILTER (WHERE rq.interval_days = 3)                      AS iv3,
+                            COUNT(DISTINCT rq.id) FILTER (WHERE rq.interval_days = 7)                      AS iv7,
+                            COUNT(DISTINCT rq.id) FILTER (WHERE rq.interval_days >= 21)                    AS iv21,
+                            COUNT(DISTINCT rq.id) FILTER (WHERE rq.lapses >= 3 AND rq.interval_days <= 3)  AS weak_count,
+                            BOOL_OR(rr.id IS NOT NULL)                                                      AS has_reviews
+                       FROM revision_questions rq
+                       LEFT JOIN revision_reviews rr ON rr.question_id = rq.id
+                      WHERE rq.archived_at IS NULL AND rq.section_id IS NOT NULL
+                      GROUP BY rq.section_id
+                 ) qc ON qc.section_id = s.id
+                WHERE n.notebook_type = 'gate_subject'
+                  AND n.archived_at IS NULL
+                  AND s.archived_at IS NULL
+                ORDER BY s.notebook_id, s.position, s.name"""
         ).fetchall()
 
         ds_rows = conn.execute(
@@ -2220,15 +2311,29 @@ async def get_gate_overview():
                 LIMIT 20"""
         ).fetchall()
 
+    sections_by_notebook: dict[int, list] = {}
+    for r in sec_rows:
+        nb_id = r[3]
+        sections_by_notebook.setdefault(nb_id, []).append({
+            "id":              r[0],
+            "name":            r[1],
+            "type":            r[2],
+            "q_total":         r[4],
+            "intervals":       {"1": r[5], "3": r[6], "7": r[7], "21": r[8]},
+            "weakness_signal": _weakness_signal(r[4], r[10], r[9]),
+        })
+
     notebooks = [
         {
-            "id":            r[0],
-            "name":          r[1],
-            "q_total":       r[2],
-            "q_due":         r[3],
-            "intervals":     {"1": r[4], "3": r[5], "7": r[6], "21": r[7]},
-            "last_review":   r[8].isoformat() if r[8] else None,
-            "avg_score_30d": float(r[9]) if r[9] is not None else None,
+            "id":              r[0],
+            "name":            r[1],
+            "q_total":         r[2],
+            "q_due":           r[3],
+            "intervals":       {"1": r[4], "3": r[5], "7": r[6], "21": r[7]},
+            "last_review":     r[8].isoformat() if r[8] else None,
+            "avg_score_30d":   float(r[9]) if r[9] is not None else None,
+            "weakness_signal": _weakness_signal(r[2], r[8] is not None, r[10]),
+            "sections":        sections_by_notebook.get(r[0], []),
         }
         for r in nb_rows
     ]
@@ -2265,6 +2370,24 @@ def _db_conn() -> psycopg.Connection:
     if not url:
         raise HTTPException(500, "BRAIN_DB_URL not set")
     return psycopg.connect(url)
+
+
+def _weakness_signal(q_total: int, has_reviews: bool, weak_count: int) -> str:
+    # Weakness signal — per question: lapses >= 3 AND interval_days <= 3 (rung 1 or 2).
+    # Clears automatically when the question reaches rung 4 (interval_days = 21),
+    # matching SuperMemo's leech resolution: a leech stops being one once it reaches
+    # a long interval. Per section / subject:
+    #   unstarted  — no revision_questions
+    #   attempted  — questions exist but no reviews yet
+    #   weak       — at least one question has lapses >= 3 and is still on rung 1 or 2
+    #   progressing — reviewed and no weak questions
+    if q_total == 0:
+        return "unstarted"
+    if not has_reviews:
+        return "attempted"
+    if weak_count > 0:
+        return "weak"
+    return "progressing"
 
 
 def _summary_snippet(text: str | None, max_len: int = 100) -> str | None:

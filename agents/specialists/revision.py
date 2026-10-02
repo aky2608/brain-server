@@ -57,6 +57,34 @@ SUBJECT_ALIASES: dict[str, str] = {
 
 LADDER = [1, 3, 7, 21]
 
+
+def _fetch_notebook_names(conn: psycopg.Connection) -> dict[str, str]:
+    """Return {lowercase_name: canonical_name} for all active notebooks, queried fresh per request."""
+    rows = conn.execute(
+        "SELECT name FROM notebooks WHERE archived_at IS NULL"
+    ).fetchall()
+    return {row[0].lower(): row[0] for row in rows}
+
+
+def _resolve_subject(hint: str, notebook_names: dict[str, str]) -> Optional[str]:
+    """Alias map first, then DB-queried canonical names, both case-insensitive."""
+    lower = hint.lower()
+    return SUBJECT_ALIASES.get(lower) or notebook_names.get(lower)
+
+
+def _greedy_resolve(tokens: list[str], notebook_names: dict[str, str]) -> Optional[tuple[str, str]]:
+    """Longest-prefix subject match. Returns (notebook_name, section_name) or None.
+
+    Tries each prefix length from longest to shortest so that multi-word notebook
+    names ("Operating Systems") are matched before their first word alone would be
+    matched as a shorter alias, leaving the rest as a spurious section name.
+    """
+    for length in range(len(tokens), 0, -1):
+        resolved = _resolve_subject(" ".join(tokens[:length]), notebook_names)
+        if resolved:
+            return resolved, " ".join(tokens[length:])
+    return None
+
 # Fail loud at import time if prompt files are missing.
 _GENERATE_TEMPLATE: str = (
     pathlib.Path(__file__).parent.parent.parent / "prompts" / "revise_generate.txt"
@@ -215,13 +243,22 @@ class RevisionAgent(BaseAgent):
     # ------------------------------------------------------------------
 
     def _handle_generate(self, subject_hint: str, chat_id: Optional[str]) -> RevisionOutput:
-        notebook_name = SUBJECT_ALIASES.get(subject_hint.lower(), subject_hint)
+        tokens = subject_hint.split()
+        if not tokens:
+            return RevisionOutput(action="error", message="Usage: /revise generate <subject> [<section>]")
+
         url = _db_url()
         if not url:
             return RevisionOutput(action="error", message="BRAIN_DB_URL not set")
 
         try:
             with psycopg.connect(url) as conn:
+                notebook_names = _fetch_notebook_names(conn)
+                resolved = _greedy_resolve(tokens, notebook_names)
+                if not resolved:
+                    return RevisionOutput(action="error", message=f"Unknown subject in {subject_hint!r}")
+                notebook_name, section_name = resolved
+
                 nb_row = conn.execute(
                     "SELECT id FROM notebooks WHERE name ILIKE %s AND archived_at IS NULL LIMIT 1",
                     (notebook_name,),
@@ -230,12 +267,33 @@ class RevisionAgent(BaseAgent):
                     return RevisionOutput(action="error", message=f"Notebook {notebook_name!r} not found")
                 notebook_id = nb_row[0]
 
+                section_id = None
+                if section_name:
+                    sec_row = conn.execute(
+                        "SELECT id FROM sections WHERE notebook_id = %s AND name ILIKE %s "
+                        "AND archived_at IS NULL LIMIT 1",
+                        (notebook_id, section_name),
+                    ).fetchone()
+                    if sec_row is None:
+                        return RevisionOutput(
+                            action="error",
+                            message=f"Section {section_name!r} not found in [{notebook_name}]",
+                        )
+                    section_id = sec_row[0]
+
+                section_clause = "AND section_id = %s" if section_id else ""
+                items_params = [notebook_id]
+                if section_id:
+                    items_params.append(section_id)
+                items_params.append(notebook_id)
+
                 items = conn.execute(
-                    """
+                    f"""
                     SELECT id, raw_content
                     FROM items
                     WHERE notebook_id = %s
                       AND status = 'active'
+                      {section_clause}
                       AND id != ALL(
                           SELECT unnest(source_item_ids)
                           FROM revision_questions
@@ -243,14 +301,15 @@ class RevisionAgent(BaseAgent):
                       )
                     ORDER BY created_at ASC
                     """,
-                    (notebook_id, notebook_id),
+                    items_params,
                 ).fetchall()
         except Exception as exc:
             logger.exception("generate: DB read failed")
             return RevisionOutput(action="error", message=f"DB error: {exc}")
 
+        scope = f"[{notebook_name}]" + (f" § {section_name}" if section_name else "")
         if not items:
-            msg = f"No new items to generate questions from in [{notebook_name}]."
+            msg = f"No new items to generate questions from in {scope}."
             if chat_id:
                 try:
                     with psycopg.connect(url) as conn:
@@ -260,7 +319,7 @@ class RevisionAgent(BaseAgent):
                     logger.exception("generate: outbox write failed (empty)")
             return RevisionOutput(action="empty", message=msg, outbox_written=True, decisions=[{
                 "agent_name": "revision_agent", "action_taken": "generate:empty",
-                "reason": f"no uncovered items in notebook={notebook_name}", "interrupt_tier": "log_only",
+                "reason": f"no uncovered items in {scope}", "interrupt_tier": "log_only",
             }])
 
         n_questions = min(5, max(3, len(items)))
@@ -284,7 +343,7 @@ class RevisionAgent(BaseAgent):
             logger.exception("generate: LLM call or parse failed")
             return RevisionOutput(action="error", message=f"Generation failed: {exc}")
 
-        msg = f"Generated {len(questions)} questions for {notebook_name}."
+        msg = f"Generated {len(questions)} questions for {scope}."
         try:
             with psycopg.connect(url) as conn:
                 for q in questions:
@@ -292,10 +351,10 @@ class RevisionAgent(BaseAgent):
                         """
                         INSERT INTO revision_questions
                             (notebook_id, source_item_ids, question, expected_answer,
-                             next_review_date, interval_days)
-                        VALUES (%s, %s::uuid[], %s, %s, CURRENT_DATE, 1)
+                             next_review_date, interval_days, section_id)
+                        VALUES (%s, %s::uuid[], %s, %s, CURRENT_DATE, 1, %s)
                         """,
-                        (notebook_id, source_ids, q["question"], q["expected_answer"]),
+                        (notebook_id, source_ids, q["question"], q["expected_answer"], section_id),
                     )
                 if chat_id:
                     self._write_outbox(conn, chat_id, msg)
@@ -306,7 +365,7 @@ class RevisionAgent(BaseAgent):
 
         return RevisionOutput(action="generated", message=msg, outbox_written=True, decisions=[{
             "agent_name": "revision_agent", "action_taken": f"generate:generated:{len(questions)}",
-            "reason": f"{len(questions)} questions written for notebook={notebook_name}", "interrupt_tier": "log_only",
+            "reason": f"{len(questions)} questions written for {scope}", "interrupt_tier": "log_only",
         }])
 
     def _handle_show(self, chat_id: Optional[str]) -> RevisionOutput:
@@ -406,10 +465,14 @@ class RevisionAgent(BaseAgent):
                     """
                     UPDATE revision_questions
                        SET interval_days    = %s,
+                           -- CASE reads interval_days from the old row (pre-update): Postgres
+                           -- evaluates all SET expressions against the original tuple, so this
+                           -- correctly tests whether the question had climbed before failing.
+                           lapses           = lapses + CASE WHEN %s < 7 AND interval_days > 1 THEN 1 ELSE 0 END,
                            next_review_date = CURRENT_DATE + %s
                      WHERE id = %s
                     """,
-                    (interval_after, interval_after, q_id),
+                    (interval_after, score, interval_after, q_id),
                 )
                 if chat_id:
                     self._write_outbox(conn, chat_id, msg)
@@ -484,10 +547,9 @@ class RevisionAgent(BaseAgent):
     def _handle_drill_start(self, rest: str, chat_id) -> RevisionOutput:
         parts = rest.split()
         if len(parts) < 2 or not parts[-1].isdigit():
-            return RevisionOutput(action="error", message="Usage: /drill start <subject> <N>")
+            return RevisionOutput(action="error", message="Usage: /drill start <subject> [<section>] <N>")
         n = int(parts[-1])
-        subject_hint = " ".join(parts[:-1])
-        notebook_name = SUBJECT_ALIASES.get(subject_hint.lower(), subject_hint)
+        subject_tokens = parts[:-1]
 
         url = _db_url()
         if not url:
@@ -495,6 +557,16 @@ class RevisionAgent(BaseAgent):
 
         try:
             with psycopg.connect(url) as conn:
+                notebook_names = _fetch_notebook_names(conn)
+                resolved = _greedy_resolve(subject_tokens, notebook_names)
+                if not resolved:
+                    return RevisionOutput(
+                        action="error",
+                        message=f"Unknown subject in {' '.join(subject_tokens)!r}. "
+                                f"Valid hints: {', '.join(sorted(SUBJECT_ALIASES.keys()))}",
+                    )
+                notebook_name, section_name = resolved
+
                 open_sess = conn.execute(
                     "SELECT id FROM drill_sessions WHERE ended_at IS NULL LIMIT 1"
                 ).fetchone()
@@ -513,28 +585,51 @@ class RevisionAgent(BaseAgent):
                     return RevisionOutput(action="error", message=f"GATE notebook {notebook_name!r} not found.")
                 notebook_id = nb_row[0]
 
+                section_id = None
+                if section_name:
+                    sec_row = conn.execute(
+                        "SELECT id FROM sections WHERE notebook_id = %s AND name ILIKE %s "
+                        "AND archived_at IS NULL LIMIT 1",
+                        (notebook_id, section_name),
+                    ).fetchone()
+                    if sec_row is None:
+                        return RevisionOutput(
+                            action="error",
+                            message=f"Section {section_name!r} not found in [{notebook_name}]",
+                        )
+                    section_id = sec_row[0]
+
+                section_clause = "AND section_id = %s" if section_id else ""
+                q_params = [notebook_id]
+                if section_id:
+                    q_params.append(section_id)
+                q_params.append(n)
+
                 questions = conn.execute(
-                    """SELECT id, question
+                    f"""SELECT id, question
                        FROM revision_questions
                        WHERE notebook_id = %s AND archived_at IS NULL
+                         {section_clause}
                        ORDER BY next_review_date ASC NULLS LAST, id ASC
                        LIMIT %s""",
-                    (notebook_id, n),
+                    q_params,
                 ).fetchall()
 
+                scope = notebook_name + (f" § {section_name}" if section_name else "")
                 if not questions:
                     return RevisionOutput(
                         action="empty",
-                        message=f"No questions available for {notebook_name}. Run /revise generate {subject_hint} first.",
+                        message=f"No questions available for {scope}. "
+                                f"Run /revise generate {' '.join(subject_tokens)} first.",
                     )
 
                 sess_id = conn.execute(
                     """INSERT INTO drill_sessions
-                           (notebook_id, started_at, questions_total, questions_answered,
+                           (notebook_id, section_id, started_at, questions_total, questions_answered,
                             verified, reason)
-                       VALUES (%s, now(), %s, 0, false, 'pending')
+                       VALUES (%s, %s, now(), %s, 0, false, 'pending')
                        RETURNING id""",
-                    (notebook_id, len(questions)),
+                    (notebook_id, section_id, len(questions)),
                 ).fetchone()[0]
 
                 for pos, (q_id, _) in enumerate(questions, start=1):
@@ -718,10 +813,13 @@ class RevisionAgent(BaseAgent):
                         (q_id, score, interval_after),
                     )
                     conn.execute(
+                        # CASE reads interval_days from the old row — see _handle_answer for the rationale.
                         "UPDATE revision_questions "
-                        "SET interval_days = %s, next_review_date = CURRENT_DATE + %s "
+                        "SET interval_days = %s, "
+                        "    lapses = lapses + CASE WHEN %s < 7 AND interval_days > 1 THEN 1 ELSE 0 END, "
+                        "    next_review_date = CURRENT_DATE + %s "
                         "WHERE id = %s",
-                        (interval_after, interval_after, q_id),
+                        (interval_after, score, interval_after, q_id),
                     )
 
                 scores = [max(0, min(10, grades.get(row[0], 5))) for row in answered_rows]
