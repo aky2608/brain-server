@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from supabase import Client, create_client
 
 from constants import EVENT_DEFAULT_MINUTES
+from db.agent_runs import record_run
 from shortcuts import lookup_shortcut, parse_slash
 
 load_dotenv()
@@ -422,10 +423,15 @@ async def watch_eval_loop():
     """Evaluate watch rules every hour. Uses the same graph path as /watch slash command."""
     await asyncio.sleep(300)  # let startup settle before first run
     while True:
-        try:
-            await _invoke_graph_bg("watch-cron", "/watch", "system")
-        except Exception as e:
-            logger.error("watch_eval_loop error", extra={"ctx": {"error": str(e)}})
+        with record_run("watch") as run:
+            try:
+                await _invoke_graph_bg("watch-cron", "/watch", "system")
+                run.outcome = "acted"
+                run.detail = "watch rules evaluated"
+            except Exception as e:
+                logger.error("watch_eval_loop error", extra={"ctx": {"error": str(e)}})
+                run.outcome = "failed"
+                run.detail = str(e)[:200]
         await asyncio.sleep(3600)
 
 
@@ -433,50 +439,59 @@ async def batch_classification_loop():
     await asyncio.sleep(30)
     while True:
         await asyncio.sleep(120)
-        try:
-            result = supabase.table("items")\
-                .select("id, raw_content, source, capture_type")\
-                .in_("classification_status", ["queued", "failed"])\
-                .order("created_at")\
-                .limit(50)\
-                .execute()
+        with record_run("batch_classification") as run:
+            try:
+                result = supabase.table("items")\
+                    .select("id, raw_content, source, capture_type")\
+                    .in_("classification_status", ["queued", "failed"])\
+                    .order("created_at")\
+                    .limit(50)\
+                    .execute()
 
-            pending = result.data
-            if not pending:
-                continue
+                pending = result.data
+                if not pending:
+                    run.detail = "queue empty"
+                    continue
 
-            print(f"[batch] processing {len(pending)} items")
-            ids = [p["id"] for p in pending]
+                print(f"[batch] processing {len(pending)} items")
+                ids = [p["id"] for p in pending]
 
-            for item_id in ids:
-                supabase.table("items").update({"classification_status": "processing"}).eq("id", item_id).execute()
-
-            raw = await classify_with_fallback(build_batch_prompt(pending))
-            clean = raw.strip().replace("```json", "").replace("```", "").strip()
-            classifications = json.loads(clean)
-
-            if len(classifications) != len(pending):
-                print(f"[batch] MISMATCH: sent {len(pending)} items, got {len(classifications)} classifications — marking batch failed for retry")
                 for item_id in ids:
-                    supabase.table("items").update({"classification_status": "failed"}).eq("id", item_id).execute()
-                continue
-            for item, cls in zip(pending, classifications):
-                supabase.table("items").update({
-                    "category": cls.get("category", "thoughts"),
-                    "subcategory": cls.get("subcategory"),
-                    "ai_tags": cls.get("tags", []),
-                    "ai_summary": cls.get("summary", ""),
-                    "action_class": cls.get("action_class", "record"),
-                    "classification_status": "done",
-                }).eq("id", item["id"]).execute()
+                    supabase.table("items").update({"classification_status": "processing"}).eq("id", item_id).execute()
 
-            print(f"[batch] done: {len(classifications)} items classified")
+                raw = await classify_with_fallback(build_batch_prompt(pending))
+                clean = raw.strip().replace("```json", "").replace("```", "").strip()
+                classifications = json.loads(clean)
 
-        except Exception as e:
-            print(f"[batch_loop] error: {e}")
-            if 'ids' in locals():
-                for item_id in ids:
-                    supabase.table("items").update({"classification_status": "queued"}).eq("id", item_id).execute()
+                if len(classifications) != len(pending):
+                    print(f"[batch] MISMATCH: sent {len(pending)} items, got {len(classifications)} classifications — marking batch failed for retry")
+                    for item_id in ids:
+                        supabase.table("items").update({"classification_status": "failed"}).eq("id", item_id).execute()
+                    run.outcome = "failed"
+                    run.detail = f"mismatch: sent {len(pending)}, got {len(classifications)}"
+                    continue
+
+                for item, cls in zip(pending, classifications):
+                    supabase.table("items").update({
+                        "category": cls.get("category", "thoughts"),
+                        "subcategory": cls.get("subcategory"),
+                        "ai_tags": cls.get("tags", []),
+                        "ai_summary": cls.get("summary", ""),
+                        "action_class": cls.get("action_class", "record"),
+                        "classification_status": "done",
+                    }).eq("id", item["id"]).execute()
+
+                run.outcome = "acted"
+                run.detail = f"{len(classifications)} items classified"
+                print(f"[batch] done: {len(classifications)} items classified")
+
+            except Exception as e:
+                print(f"[batch_loop] error: {e}")
+                run.outcome = "failed"
+                run.detail = str(e)[:200]
+                if 'ids' in locals():
+                    for item_id in ids:
+                        supabase.table("items").update({"classification_status": "queued"}).eq("id", item_id).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +593,23 @@ def _mark_job_retry_or_dead(job_id: str, attempts: int, max_attempts: int, error
 
 async def job_queue_worker() -> None:
     import traceback
+    _KEEPALIVE = 300  # write one agent_runs row per 5 minutes, with a job count
+    _last_keepalive = time.monotonic()
+    _jobs_since_keepalive = 0
+
+    def _maybe_keepalive() -> None:
+        nonlocal _last_keepalive, _jobs_since_keepalive
+        if time.monotonic() - _last_keepalive < _KEEPALIVE:
+            return
+        with record_run("job_queue") as run:
+            if _jobs_since_keepalive:
+                run.outcome = "acted"
+                run.detail = f"{_jobs_since_keepalive} job(s) processed"
+            else:
+                run.detail = "queue empty"
+        _last_keepalive = time.monotonic()
+        _jobs_since_keepalive = 0
+
     recovered = _recover_stale_locks()
     if recovered:
         logger.info("stale lock recovery", extra={"ctx": {"recovered": recovered}})
@@ -586,6 +618,7 @@ async def job_queue_worker() -> None:
         try:
             job = _claim_next_job()
             if job is None:
+                _maybe_keepalive()
                 await asyncio.sleep(2)
                 continue
 
@@ -606,9 +639,11 @@ async def job_queue_worker() -> None:
                     raise ValueError(f"unknown job_type: {job['job_type']!r}")
                 _mark_job_done(job["id"])
                 logger.info("job done", extra={"ctx": {"job_id": job["id"]}})
+                _jobs_since_keepalive += 1
             except Exception:
                 _mark_job_retry_or_dead(job["id"], job["attempts"], job["max_attempts"],
                                         traceback.format_exc())
+            _maybe_keepalive()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -653,6 +688,23 @@ def _mark_outbox_attempt(outbox_id: str, error: str) -> None:
 
 
 async def outbox_delivery_loop() -> None:
+    _KEEPALIVE = 300  # write one agent_runs row per 5 minutes, with a delivery count
+    _last_keepalive = time.monotonic()
+    _delivered_since_keepalive = 0
+
+    def _maybe_keepalive() -> None:
+        nonlocal _last_keepalive, _delivered_since_keepalive
+        if time.monotonic() - _last_keepalive < _KEEPALIVE:
+            return
+        with record_run("outbox") as run:
+            if _delivered_since_keepalive:
+                run.outcome = "acted"
+                run.detail = f"{_delivered_since_keepalive} message(s) delivered"
+            else:
+                run.detail = "nothing pending"
+        _last_keepalive = time.monotonic()
+        _delivered_since_keepalive = 0
+
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     tg_base = f"https://api.telegram.org/bot{tg_token}"
 
@@ -678,6 +730,7 @@ async def outbox_delivery_loop() -> None:
                         _mark_outbox_sent(row["id"])
                         logger.info("outbox sent", extra={"ctx": {"outbox_id": row["id"],
                                                                    "channel": row["channel"]}})
+                        _delivered_since_keepalive += 1
                     else:
                         raise ValueError(f"unknown channel: {row['channel']!r}")
                 except Exception as e:
@@ -688,6 +741,7 @@ async def outbox_delivery_loop() -> None:
             raise
         except Exception as e:
             logger.error("outbox loop error", extra={"ctx": {"error": str(e)}})
+        _maybe_keepalive()
         await asyncio.sleep(5)
 
 

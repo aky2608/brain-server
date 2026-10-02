@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 
+from db.agent_runs import record_run
+
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 _GATE_WINDOW_DEFAULT = 7
@@ -180,42 +182,45 @@ def main() -> None:
     url = _db_url()
     chat_id = _tg_chat_id()
 
-    with psycopg.connect(url) as conn:
-        today_lines = _section_today(conn)
-        rollover_lines = _section_rollovers(conn)
-        due_lines = _section_due(conn)
-        watch_lines, watch_ids = _section_watch(conn)
-        overdue_lines = _section_overdue(conn)
+    with record_run("brief") as run:
+        with psycopg.connect(url) as conn:
+            today_lines = _section_today(conn)
+            rollover_lines = _section_rollovers(conn)
+            due_lines = _section_due(conn)
+            watch_lines, watch_ids = _section_watch(conn)
+            overdue_lines = _section_overdue(conn)
 
-        all_sections = [today_lines, rollover_lines, due_lines, watch_lines, overdue_lines]
-        body_parts = ["\n".join(s) for s in all_sections if s]
+            all_sections = [today_lines, rollover_lines, due_lines, watch_lines, overdue_lines]
+            body_parts = ["\n".join(s) for s in all_sections if s]
 
-        if body_parts:
-            message = "\n\n".join(body_parts)
-        else:
-            message = "Good morning \u2014 nothing scheduled today."
+            if body_parts:
+                message = "\n\n".join(body_parts)
+            else:
+                message = "Good morning \u2014 nothing scheduled today."
 
-        conn.execute(
-            "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
-            (chat_id, message),
-        )
-
-        if watch_ids:
-            # Marks morning_brief decisions as consumed so they don't repeat tomorrow.
-            # dismissed_at here means "delivered by brief", not "dismissed in dashboard".
-            # The two meanings are merged: morning_brief decisions never appear in the
-            # interrupts tile (that query filters interrupt_tier='always'), so there is
-            # no current UI side-effect. A separate briefed_at column would be cleaner
-            # if the dashboard ever surfaces delivery status independently.
             conn.execute(
-                "UPDATE agent_decisions SET dismissed_at = now() WHERE id = ANY(%s)",
-                (watch_ids,),
+                "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
+                (chat_id, message),
             )
 
-        conn.commit()
+            if watch_ids:
+                # Marks morning_brief decisions as consumed so they don't repeat tomorrow.
+                # dismissed_at here means "delivered by brief", not "dismissed in dashboard".
+                # The two meanings are merged: morning_brief decisions never appear in the
+                # interrupts tile (that query filters interrupt_tier='always'), so there is
+                # no current UI side-effect. A separate briefed_at column would be cleaner
+                # if the dashboard ever surfaces delivery status independently.
+                conn.execute(
+                    "UPDATE agent_decisions SET dismissed_at = now() WHERE id = ANY(%s)",
+                    (watch_ids,),
+                )
 
-    sections_sent = sum(1 for s in all_sections if s)
-    print(f"brief: sent ({sections_sent} section(s), {len(watch_ids)} watch notice(s) marked)")
+            conn.commit()
+
+        sections_sent = sum(1 for s in all_sections if s)
+        run.outcome = "acted"
+        run.detail = f"{sections_sent} section(s), {len(watch_ids)} watch notice(s) marked"
+        print(f"brief: sent ({sections_sent} section(s), {len(watch_ids)} watch notice(s) marked)")
 
 
 if __name__ == "__main__":

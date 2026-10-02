@@ -20,6 +20,8 @@ from datetime import date, timedelta
 import httpx
 import psycopg
 
+from db.agent_runs import record_run
+
 _IST_OFFSET  = timedelta(hours=5, minutes=30)
 _PROMPT_PATH = pathlib.Path(__file__).parent / "prompts" / "review_weekly.txt"
 _PROMPT_TMPL = _PROMPT_PATH.read_text()
@@ -156,39 +158,43 @@ def main() -> None:
     week_start, week_end = _week_bounds()
     print(f"weekly_review: week {week_start} – {week_end}")
 
-    with psycopg.connect(_db_url()) as conn:
-        sections = _active_sections(conn, week_start, week_end)
+    with record_run("weekly_review") as run:
+        with psycopg.connect(_db_url()) as conn:
+            sections = _active_sections(conn, week_start, week_end)
 
-        if not sections:
-            print("weekly_review: no active sections this week, nothing to do")
-            return
+            if not sections:
+                run.detail = f"no active sections for week {week_start}"
+                print("weekly_review: no active sections this week, nothing to do")
+                return
 
-        print(f"weekly_review: {len(sections)} active section(s)")
-        written = 0
+            print(f"weekly_review: {len(sections)} active section(s)")
+            written = 0
 
-        for sec in sections:
-            sid  = sec["section_id"]
-            snm  = sec["section_name"]
-            nid  = sec["notebook_id"]
-            nnm  = sec["notebook_name"]
+            for sec in sections:
+                sid  = sec["section_id"]
+                snm  = sec["section_name"]
+                nid  = sec["notebook_id"]
+                nnm  = sec["notebook_name"]
 
-            items                 = _section_items(conn, sid, week_start, week_end)
-            drill_count, avg_score = _notebook_drill_stats(conn, nid, week_start, week_end)
-            prompt                = _build_prompt(snm, nnm, week_start, week_end,
-                                                  items, drill_count, avg_score)
-            try:
-                summary = _call_llm(prompt).strip()
-            except Exception as e:
-                print(f"  [{snm}] LLM call failed: {e} — skipping", file=sys.stderr)
-                continue
+                items                 = _section_items(conn, sid, week_start, week_end)
+                drill_count, avg_score = _notebook_drill_stats(conn, nid, week_start, week_end)
+                prompt                = _build_prompt(snm, nnm, week_start, week_end,
+                                                      items, drill_count, avg_score)
+                try:
+                    summary = _call_llm(prompt).strip()
+                except Exception as e:
+                    print(f"  [{snm}] LLM call failed: {e} — skipping", file=sys.stderr)
+                    continue
 
-            _upsert_summary(conn, sid, week_start, summary)
-            print(f"  [{snm}] written ({len(items)} items, {drill_count} drills)")
-            written += 1
+                _upsert_summary(conn, sid, week_start, summary)
+                print(f"  [{snm}] written ({len(items)} items, {drill_count} drills)")
+                written += 1
 
-        conn.commit()
+            conn.commit()
 
-    print(f"weekly_review: done — {written}/{len(sections)} section(s) written")
+        run.outcome = "acted"
+        run.detail = f"{written}/{len(sections)} section(s) written for week {week_start}"
+        print(f"weekly_review: done — {written}/{len(sections)} section(s) written")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 
 import psycopg
 
+from db.agent_runs import record_run
+
 _IST = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -60,64 +62,68 @@ def main() -> None:
     url = _db_url()
     chat_id = _tg_chat_id()
 
-    with psycopg.connect(url) as conn:
-        rows = conn.execute(
-            """SELECT id, title, raw_content, starts_at, time_inferred
-                 FROM items
-                WHERE status = 'active'
-                  AND starts_at IS NOT NULL
-                  AND reminded_at IS NULL
-                  AND task_status IS DISTINCT FROM 'done'
-                  AND (
-                    -- explicit time: offset window before starts_at
-                    (time_inferred = false
-                     AND now() >= starts_at
-                              - make_interval(mins => COALESCE(reminder_offset_minutes, 60))
-                     AND now() < starts_at)
-                    OR
-                    -- inferred time (09:00 default): fire at 08:00 on the day
-                    (time_inferred = true
-                     AND now() >= starts_at - interval '1 hour'
-                     AND now() < starts_at)
-                  )""",
-        ).fetchall()
+    with record_run("reminder") as run:
+        with psycopg.connect(url) as conn:
+            rows = conn.execute(
+                """SELECT id, title, raw_content, starts_at, time_inferred
+                     FROM items
+                    WHERE status = 'active'
+                      AND starts_at IS NOT NULL
+                      AND reminded_at IS NULL
+                      AND task_status IS DISTINCT FROM 'done'
+                      AND (
+                        -- explicit time: offset window before starts_at
+                        (time_inferred = false
+                         AND now() >= starts_at
+                                  - make_interval(mins => COALESCE(reminder_offset_minutes, 60))
+                         AND now() < starts_at)
+                        OR
+                        -- inferred time (09:00 default): fire at 08:00 on the day
+                        (time_inferred = true
+                         AND now() >= starts_at - interval '1 hour'
+                         AND now() < starts_at)
+                      )""",
+            ).fetchall()
 
-        if not rows:
-            print("reminder: nothing due")
-            return
+            if not rows:
+                run.detail = "nothing due"
+                print("reminder: nothing due")
+                return
 
-        now = datetime.now(_IST)
-        fired = 0
+            now = datetime.now(_IST)
+            fired = 0
 
-        for item_id, title, raw_content, starts_at, time_inferred in rows:
-            name = _item_name(title, raw_content or "")
-            message = _build_message(name, starts_at, time_inferred, now)
+            for item_id, title, raw_content, starts_at, time_inferred in rows:
+                name = _item_name(title, raw_content or "")
+                message = _build_message(name, starts_at, time_inferred, now)
 
-            # Atomic: outbox write + reminded_at stamp — crash-safe, no double-send
-            conn.execute(
-                """INSERT INTO outbox (channel, recipient, message)
-                   VALUES ('telegram', %s, %s)""",
-                (chat_id, message),
-            )
-            conn.execute(
-                "UPDATE items SET reminded_at = now() WHERE id = %s",
-                (item_id,),
-            )
-            conn.execute(
-                """INSERT INTO agent_decisions
-                       (agent_name, item_id, action_taken, reason, interrupt_tier)
-                   VALUES ('scheduling_agent', %s, 'reminder_sent', %s, 'log_only')""",
-                (
-                    str(item_id),
-                    f"reminder fired for '{name}' — starts_at {starts_at.isoformat()} "
-                    f"time_inferred={time_inferred}",
-                ),
-            )
-            fired += 1
+                # Atomic: outbox write + reminded_at stamp — crash-safe, no double-send
+                conn.execute(
+                    """INSERT INTO outbox (channel, recipient, message)
+                       VALUES ('telegram', %s, %s)""",
+                    (chat_id, message),
+                )
+                conn.execute(
+                    "UPDATE items SET reminded_at = now() WHERE id = %s",
+                    (item_id,),
+                )
+                conn.execute(
+                    """INSERT INTO agent_decisions
+                           (agent_name, item_id, action_taken, reason, interrupt_tier)
+                       VALUES ('scheduling_agent', %s, 'reminder_sent', %s, 'log_only')""",
+                    (
+                        str(item_id),
+                        f"reminder fired for '{name}' — starts_at {starts_at.isoformat()} "
+                        f"time_inferred={time_inferred}",
+                    ),
+                )
+                fired += 1
 
-        conn.commit()
+            conn.commit()
 
-    print(f"reminder: {fired} reminder(s) sent")
+        run.outcome = "acted"
+        run.detail = f"{fired} reminder(s) sent"
+        print(f"reminder: {fired} reminder(s) sent")
 
 
 if __name__ == "__main__":
