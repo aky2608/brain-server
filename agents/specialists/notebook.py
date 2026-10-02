@@ -51,6 +51,8 @@ SUBJECT_ALIASES: dict[str, str] = {
 
 VALID_TYPES = {"gate_subject", "general", "project"}
 
+_LEARNED_RE = re.compile(r"#learned\b", re.IGNORECASE)
+
 
 class NotebookInput(NarrowModel):
     raw_input: str
@@ -143,6 +145,7 @@ class NotebookAgent(BaseAgent):
 
         if item_id:
             clean_content = " ".join(tokens[1:])
+            is_learned = bool(_LEARNED_RE.search(clean_content)) or clean_content.lstrip().upper().startswith("TIL:")
 
             # Embed outside the write connection (network call to Gemini).
             vector = _embed(clean_content)
@@ -154,9 +157,10 @@ class NotebookAgent(BaseAgent):
                         """UPDATE items
                               SET notebook_id = %s,
                                   subcategory = 'gate',
-                                  raw_content = %s
+                                  raw_content = %s,
+                                  learned = learned OR %s
                             WHERE id = %s""",
-                        (notebook_id, clean_content, item_id),
+                        (notebook_id, clean_content, is_learned, item_id),
                     )
                     if vector:
                         _store_embedding(item_id, vector, conn)

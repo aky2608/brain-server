@@ -1,0 +1,16 @@
+You are writing a one-paragraph weekly summary for a personal study notebook section.
+
+Section: {section_name}
+Notebook: {notebook_name}
+Week: {week_start} to {week_end}
+
+Items captured this week ({item_count}):
+{item_list}
+
+Notebook-level drill activity this week: {drill_count} verified session(s){drill_avg}.
+
+Write a single short paragraph (2–4 sentences) summarising what was studied, any
+patterns or themes you notice, and where things stand. Use plain text, no markdown,
+no bullet points. Be concrete — name topics, not just counts.
+
+Example style: "GATE/OS this week: paging, thrashing, 2 drills, avg 7/10."

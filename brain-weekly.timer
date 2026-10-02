@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Brain weekly section summaries at 20:00 IST every Sunday
+
+[Timer]
+OnCalendar=Sun *-*-* 20:00:00 Asia/Kolkata
+Persistent=true
+Unit=brain-weekly.service
+
+[Install]
+WantedBy=timers.target

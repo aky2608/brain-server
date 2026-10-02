@@ -110,6 +110,37 @@ _CLASSIFY_TEMPLATE: str = (
     pathlib.Path(__file__).parent / "prompts" / "classify_single.txt"
 ).read_text()
 
+_LEARNED_RE = re.compile(r"#learned\b", re.IGNORECASE)
+
+# ---------------------------------------------------------------------------
+# Column groups — compose to build per-endpoint projections.
+# Add a new items column to the right group; every endpoint using that group
+# picks it up automatically. Never include embedding vectors or tsvectors.
+# ---------------------------------------------------------------------------
+_ITEM_CORE     = "id, title, raw_content, ai_summary, category, created_at"
+_ITEM_TASK     = "task_status, task_deadline, task_progress, plan_bucket, plan_order, plan_date, rollover_note"
+_ITEM_TIME     = "starts_at, ends_at, is_event, time_inferred"
+_ITEM_NOTEBOOK = "notebook_id, section_id, learned"
+_ITEM_CAPTURE  = (
+    "updated_at, source, capture_type, subcategory, action_class, ai_tags, "
+    "location_lat, location_lng, location_name, metadata, status, "
+    "mood_score, energy_score, reviewed, streak_data, "
+    "classification_status, corrected_category, corrected_at, "
+    "capture_uuid, embedding_model"
+)
+
+
+def _cols(*parts: str) -> str:
+    return ", ".join(p.strip().strip(",") for p in parts)
+
+
+# Composed projections used by the five main item-listing endpoints.
+_TASK_COLS          = _cols(_ITEM_CORE, _ITEM_CAPTURE, _ITEM_TASK, "notebook_id")
+_PLANNER_COLS       = _cols(_ITEM_CORE, _ITEM_TASK, _ITEM_TIME, "subcategory, action_class, status")
+_CAL_COLS           = _cols(_ITEM_CORE, _ITEM_TASK, _ITEM_TIME, "action_class")
+_NOTEBOOK_ITEM_COLS = _cols(_ITEM_CORE, _ITEM_NOTEBOOK)
+_TIMELINE_COLS      = _cols(_ITEM_CORE, _ITEM_TASK)
+
 
 class CaptureInput(BaseModel):
     content: str
@@ -811,6 +842,7 @@ async def capture(data: CaptureInput):
     else:
         classification_status = "queued"
 
+    learned = bool(_LEARNED_RE.search(content)) or content.lstrip().upper().startswith("TIL:")
     insert_payload = {
         "raw_content": content,
         "source": data.source,
@@ -819,6 +851,7 @@ async def capture(data: CaptureInput):
         "location_lat": data.lat,
         "location_lng": data.lng,
         "metadata": metadata,
+        "learned": learned,
     }
     if data.category:
         insert_payload["category"] = data.category
@@ -924,7 +957,6 @@ async def update_item(item_id: str, updates: dict):
 
 @app.get("/tasks", dependencies=[Depends(verify_api_key)])
 async def get_tasks(status: Optional[str] = None):
-    _TASK_COLS = "id,created_at,updated_at,source,capture_type,category,subcategory,action_class,raw_content,ai_summary,ai_tags,location_lat,location_lng,location_name,metadata,status,task_status,task_deadline,task_progress,plan_bucket,plan_order,plan_date,mood_score,energy_score,reviewed,streak_data,classification_status,corrected_category,corrected_at,capture_uuid,embedding_model,rollover_note,title,notebook_id"
     query = supabase.table("items").select(_TASK_COLS).eq("action_class", "task")
     if status:
         if status == "pending":
@@ -960,7 +992,6 @@ async def get_planner_counts():
 
 @app.get("/planner", dependencies=[Depends(verify_api_key)])
 async def get_planner(bucket: Optional[str] = None):
-    _PLANNER_COLS = "id,raw_content,title,ai_summary,category,subcategory,action_class,task_status,task_progress,task_deadline,plan_order,rollover_note,plan_bucket,plan_date,status,created_at,starts_at,is_event,time_inferred"
     query = supabase.table("items").select(_PLANNER_COLS)
     if bucket:
         query = query.eq("plan_bucket", bucket)
@@ -969,11 +1000,6 @@ async def get_planner(bucket: Optional[str] = None):
     result = query.order("plan_order").order("created_at", desc=True).execute()
     return {"items": result.data}
 
-
-_CAL_COLS = (
-    "id, raw_content, title, ai_summary, category, action_class, task_status, "
-    "starts_at, ends_at, is_event, time_inferred, task_deadline, plan_date, plan_bucket"
-)
 
 @app.get("/calendar", dependencies=[Depends(verify_api_key)])
 async def get_calendar(
@@ -991,7 +1017,7 @@ async def get_calendar(
 
     try:
         with psycopg.connect(_db_url()) as conn:
-            rows = conn.execute(
+            cur = conn.execute(
                 f"""
                 SELECT {_CAL_COLS},
                        CASE
@@ -1026,16 +1052,13 @@ async def get_calendar(
                  frm_dt, to_dt,        # WHERE event
                  frm_dt, to_dt,        # WHERE deadline
                  frm_date, to_date),   # WHERE plan_date (date column — pass date)
-            ).fetchall()
+            )
+            rows = cur.fetchall()
     except Exception:
         logger.exception("get_calendar: DB query failed")
         raise HTTPException(500, "query failed")
 
-    col_names = [
-        "id", "raw_content", "title", "ai_summary", "category", "action_class",
-        "task_status", "starts_at", "ends_at", "is_event", "time_inferred",
-        "task_deadline", "plan_date", "plan_bucket", "slot",
-    ]
+    col_names = [desc[0] for desc in cur.description]
     items = []
     for r in rows:
         row = dict(zip(col_names, r))
@@ -1098,7 +1121,7 @@ async def get_agent_today():
 
     r_timeline = (
         supabase.table("items")
-        .select("id, raw_content, title, ai_summary, category, task_status, task_progress, task_deadline, plan_order, rollover_note")
+        .select(_TIMELINE_COLS)
         .eq("plan_bucket", "today").eq("action_class", "task").eq("status", "active")
         .order("plan_order").order("created_at", desc=True)
         .execute()
@@ -1920,12 +1943,12 @@ async def get_notebook_items(
     section_filter = " AND section_id IS NULL" if unsectioned else ""
     with _db_conn() as conn:
         rows = conn.execute(
-            f"""SELECT id, title, raw_content, ai_summary, category, created_at
+            f"""SELECT {_NOTEBOOK_ITEM_COLS}
                   FROM items
                  WHERE notebook_id = %s
                    AND status != 'deleted'
                    {section_filter}
-                 ORDER BY created_at DESC
+                 ORDER BY learned DESC, created_at DESC
                  LIMIT %s OFFSET %s""",
             (notebook_id, limit, offset),
         ).fetchall()
@@ -1933,6 +1956,8 @@ async def get_notebook_items(
             f"SELECT COUNT(*) FROM items WHERE notebook_id = %s AND status != 'deleted'{section_filter}",
             (notebook_id,),
         ).fetchone()
+    # _NOTEBOOK_ITEM_COLS = id, title, raw_content, ai_summary, category,
+    #                       created_at, notebook_id, section_id, learned
     return {
         "items": [
             {
@@ -1942,6 +1967,9 @@ async def get_notebook_items(
                 "ai_summary":  r[3],
                 "category":    r[4],
                 "created_at":  r[5].isoformat() if r[5] else None,
+                "notebook_id": r[6],
+                "section_id":  r[7],
+                "learned":     r[8],
             }
             for r in rows
         ],
@@ -1958,10 +1986,14 @@ async def get_notebook_sections(notebook_id: int, include_archived: bool = False
         rows = conn.execute(
             f"""SELECT s.id, s.name, s.position, s.created_at, s.archived_at,
                        COALESCE(ic.item_count, 0),
-                       COALESCE(qc.question_count, 0)
+                       COALESCE(qc.question_count, 0),
+                       COALESCE(ic.learned_count, 0),
+                       ss.summary
                   FROM sections s
                   LEFT JOIN (
-                      SELECT section_id, COUNT(*) AS item_count
+                      SELECT section_id,
+                             COUNT(*) AS item_count,
+                             COUNT(*) FILTER (WHERE learned = TRUE) AS learned_count
                         FROM items
                        WHERE status != 'deleted' AND section_id IS NOT NULL
                        GROUP BY section_id
@@ -1972,6 +2004,13 @@ async def get_notebook_sections(notebook_id: int, include_archived: bool = False
                        WHERE archived_at IS NULL AND section_id IS NOT NULL
                        GROUP BY section_id
                   ) qc ON qc.section_id = s.id
+                  LEFT JOIN LATERAL (
+                      SELECT summary
+                        FROM section_summaries
+                       WHERE section_id = s.id
+                       ORDER BY week_start DESC
+                       LIMIT 1
+                  ) ss ON TRUE
                   {archived_filter}
                   ORDER BY s.position, s.name""",
             (notebook_id,),
@@ -1990,6 +2029,8 @@ async def get_notebook_sections(notebook_id: int, include_archived: bool = False
                 "archived_at":    r[4].isoformat() if r[4] else None,
                 "item_count":     r[5],
                 "question_count": r[6],
+                "learned_count":  r[7],
+                "latest_summary": r[8],
             }
             for r in rows
         ],
@@ -2070,11 +2111,11 @@ async def create_section(notebook_id: int, data: SectionCreate):
 async def get_section_items(section_id: int, limit: int = 50, offset: int = 0):
     with _db_conn() as conn:
         rows = conn.execute(
-            """SELECT id, title, raw_content, ai_summary, category, created_at
+            """SELECT id, title, raw_content, ai_summary, category, created_at, learned
                  FROM items
                 WHERE section_id = %s
                   AND status != 'deleted'
-                ORDER BY created_at DESC
+                ORDER BY learned DESC, created_at DESC
                 LIMIT %s OFFSET %s""",
             (section_id, limit, offset),
         ).fetchall()
@@ -2091,6 +2132,7 @@ async def get_section_items(section_id: int, limit: int = 50, offset: int = 0):
                 "ai_summary":  r[3],
                 "category":    r[4],
                 "created_at":  r[5].isoformat() if r[5] else None,
+                "learned":     r[6],
             }
             for r in rows
         ],
@@ -2350,7 +2392,7 @@ async def archive_project(project_id: str):
 async def get_backlinks(item_id: str):
     with _db_conn() as conn:
         rows = conn.execute(
-            """SELECT i.id, i.title, i.category, i.ai_summary,
+            """SELECT i.id, i.title, i.raw_content, i.category, i.ai_summary,
                       tl.link_type, tl.wikilink_text, tl.similarity_score
                  FROM thought_links tl
                  JOIN items i ON i.id = tl.source_item_id
@@ -2363,12 +2405,12 @@ async def get_backlinks(item_id: str):
     backlinks = [
         {
             "source_id":        str(r[0]),
-            "title":            r[1],
-            "category":         r[2],
-            "summary":          _summary_snippet(r[3]),
-            "link_type":        r[4],
-            "wikilink_text":    r[5],
-            "similarity_score": r[6],
+            "title":            r[1] or (r[2] or "")[:60],
+            "category":         r[3],
+            "summary":          _summary_snippet(r[4]),
+            "link_type":        r[5],
+            "wikilink_text":    r[6],
+            "similarity_score": r[7],
         }
         for r in rows
     ]
@@ -2379,7 +2421,7 @@ async def get_backlinks(item_id: str):
 async def get_forward_links(item_id: str):
     with _db_conn() as conn:
         rows = conn.execute(
-            """SELECT i.id, i.title, i.category, i.ai_summary,
+            """SELECT i.id, i.title, i.raw_content, i.category, i.ai_summary,
                       tl.link_type, tl.wikilink_text, tl.similarity_score
                  FROM thought_links tl
                  JOIN items i ON i.id = tl.target_item_id
@@ -2392,12 +2434,12 @@ async def get_forward_links(item_id: str):
     links = [
         {
             "target_id":        str(r[0]),
-            "title":            r[1],
-            "category":         r[2],
-            "summary":          _summary_snippet(r[3]),
-            "link_type":        r[4],
-            "wikilink_text":    r[5],
-            "similarity_score": r[6],
+            "title":            r[1] or (r[2] or "")[:60],
+            "category":         r[3],
+            "summary":          _summary_snippet(r[4]),
+            "link_type":        r[5],
+            "wikilink_text":    r[6],
+            "similarity_score": r[7],
         }
         for r in rows
     ]
