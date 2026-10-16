@@ -1,5 +1,6 @@
 import asyncio
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -45,6 +46,37 @@ async def edit_message_reply_markup(chat_id: int, message_id: int) -> None:
                                 "reply_markup": {"inline_keyboard": [[]]}})
 
 
+async def edit_message_text(chat_id: int, message_id: int, text: str,
+                            reply_markup: dict | None = None) -> None:
+    payload: dict = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(f"{TG_BASE}/editMessageText", json=payload)
+
+
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _render_today_section(items: list[dict]) -> str:
+    lines = ["\U0001f4c5 Today"]
+    for i, item in enumerate(items, 1):
+        name = ((item.get("title") or item.get("raw_content")) or "").strip()[:80]
+        starts_at = item.get("starts_at")
+        done = item.get("task_status") == "done"
+        if starts_at:
+            dt = datetime.fromisoformat(starts_at).astimezone(_IST)
+            prefix = "~" if item.get("time_inferred") else ""
+            time_str = f"{prefix}{dt.strftime('%H:%M')}"
+            line = f"  {i}. {time_str}  {name}"
+        else:
+            line = f"  {i}. {name}"
+        if done:
+            line += " \u2705"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 async def capture_to_brain(
     content: str,
     source: str = "telegram",
@@ -59,12 +91,65 @@ async def capture_to_brain(
         return r.json()
 
 
+async def _handle_done_callback(cb_id: str, data: str, chat_id: int, message_id: int,
+                                msg_text: str) -> None:
+    """Handle done:<brief_id>:<idx> callback."""
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        await answer_callback(cb_id, "Bad callback data")
+        return
+    _, brief_id, idx_str = parts
+    endpoint = f"{BRAIN_API}/brief/{brief_id}/complete/{idx_str}"
+
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(endpoint, headers=BRAIN_HEADERS)
+
+        if r.status_code == 409:
+            await answer_callback(cb_id, "Already done")
+            return
+        if r.status_code == 400:
+            await answer_callback(cb_id, r.json().get("detail", "Bad request"))
+            return
+        r.raise_for_status()
+        result = r.json()
+
+        items = result["items"]
+        new_today = _render_today_section(items)
+
+        # Replace just the Today section; leave other sections intact.
+        sections = msg_text.split("\n\n")
+        new_sections = [new_today if s.startswith("\U0001f4c5 Today") else s for s in sections]
+        new_text = "\n\n".join(new_sections)
+
+        # Rebuild keyboard: drop buttons for done items.
+        remaining_buttons = [
+            {"text": f"\u2705 {i}", "callback_data": f"done:{brief_id}:{i}"}
+            for i, item in enumerate(items, 1)
+            if item["task_status"] != "done"
+        ]
+        new_markup = {"inline_keyboard": [remaining_buttons]} if remaining_buttons else None
+
+        await answer_callback(cb_id, "Done \u2705")
+        if chat_id and message_id:
+            await edit_message_text(chat_id, message_id, new_text, new_markup)
+
+    except Exception as e:
+        print(f"[bot] done callback error (brief={brief_id} idx={idx_str}): {e}")
+        await answer_callback(cb_id, f"Error: {str(e)[:100]}")
+
+
 async def handle_callback(cb: dict) -> None:
     cb_id = cb["id"]
     data = cb.get("data", "")
     msg = cb.get("message", {})
     chat_id = msg.get("chat", {}).get("id")
     message_id = msg.get("message_id")
+    msg_text = msg.get("text", "")
+
+    if data.startswith("done:"):
+        await _handle_done_callback(cb_id, data, chat_id, message_id, msg_text)
+        return
 
     parts = data.split(":", 1)
     if len(parts) != 2 or parts[0] not in ("promote", "kill"):

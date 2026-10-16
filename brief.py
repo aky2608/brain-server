@@ -16,6 +16,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import psycopg
+from psycopg.types.json import Jsonb
 
 from db.agent_runs import record_run
 
@@ -55,9 +56,10 @@ def _fmt_time(dt: datetime, inferred: bool) -> str:
 # Section builders — each returns a list of lines or []
 # ---------------------------------------------------------------------------
 
-def _section_today(conn: psycopg.Connection) -> list[str]:
+def _section_today(conn: psycopg.Connection) -> tuple[list[str], list[str]]:
+    """Returns (lines, ordered_item_ids)."""
     rows = conn.execute(
-        """SELECT title, raw_content, starts_at, time_inferred
+        """SELECT id, title, raw_content, starts_at, time_inferred
              FROM items
             WHERE status = 'active'
               AND plan_bucket = 'today'
@@ -66,15 +68,17 @@ def _section_today(conn: psycopg.Connection) -> list[str]:
             ORDER BY starts_at NULLS LAST, plan_order NULLS LAST""",
     ).fetchall()
     if not rows:
-        return []
+        return [], []
     lines = ["\U0001f4c5 Today"]
-    for title, raw_content, starts_at, time_inferred in rows:
+    item_ids: list[str] = []
+    for i, (id_, title, raw_content, starts_at, time_inferred) in enumerate(rows, 1):
+        item_ids.append(str(id_))
         name = _item_name(title, raw_content)
         if starts_at:
-            lines.append(f"  {_fmt_time(starts_at, time_inferred)}  {name}")
+            lines.append(f"  {i}. {_fmt_time(starts_at, time_inferred)}  {name}")
         else:
-            lines.append(f"  \u2022 {name}")
-    return lines
+            lines.append(f"  {i}. {name}")
+    return lines, item_ids
 
 
 def _section_rollovers(conn: psycopg.Connection) -> list[str]:
@@ -184,11 +188,20 @@ def main() -> None:
 
     with record_run("brief") as run:
         with psycopg.connect(url) as conn:
-            today_lines = _section_today(conn)
+            today_lines, today_item_ids = _section_today(conn)
             rollover_lines = _section_rollovers(conn)
             due_lines = _section_due(conn)
             watch_lines, watch_ids = _section_watch(conn)
             overdue_lines = _section_overdue(conn)
+
+            # Persist the ordered item list so /done and ✅ buttons can resolve indices.
+            brief_run_id: int | None = None
+            if today_item_ids:
+                row = conn.execute(
+                    "INSERT INTO brief_runs (item_ids) VALUES (%s) RETURNING id",
+                    (Jsonb(today_item_ids),),
+                ).fetchone()
+                brief_run_id = row[0] if row else None
 
             all_sections = [today_lines, rollover_lines, due_lines, watch_lines, overdue_lines]
             body_parts = ["\n".join(s) for s in all_sections if s]
@@ -198,9 +211,17 @@ def main() -> None:
             else:
                 message = "Good morning \u2014 nothing scheduled today."
 
+            keyboard: dict | None = None
+            if brief_run_id and today_item_ids:
+                keyboard = {"inline_keyboard": [[
+                    {"text": f"\u2705 {i}", "callback_data": f"done:{brief_run_id}:{i}"}
+                    for i in range(1, len(today_item_ids) + 1)
+                ]]}
+
             conn.execute(
-                "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
-                (chat_id, message),
+                "INSERT INTO outbox (channel, recipient, message, reply_markup)"
+                " VALUES ('telegram', %s, %s, %s)",
+                (chat_id, message, Jsonb(keyboard) if keyboard else None),
             )
 
             if watch_ids:

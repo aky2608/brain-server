@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from langgraph.graph import END
 
 from agents.base import GraphState
+from db.agent_runs import record_run
 from agents.specialists.capture import (
     _IST,
     _check_calendar_conflict,
@@ -328,6 +329,98 @@ def _capture_fragments(fragments: list[str]) -> int:
     return inserted
 
 
+def _handle_done(raw: str, source: str) -> str:
+    """Parse /done <n>..., mark each by brief index, return reply text."""
+    rest = raw.strip()[len("/done"):].strip()
+    try:
+        indices = [int(t) for t in rest.split() if t.isdigit()]
+    except Exception:
+        indices = []
+    if not indices:
+        return "Usage: /done 1  or  /done 1 3"
+
+    url = _db_url()
+    if not url:
+        return "DB unavailable."
+
+    with record_run("done") as run:
+        try:
+            with psycopg.connect(url) as conn:
+                row = conn.execute(
+                    "SELECT id, item_ids FROM brief_runs ORDER BY sent_at DESC LIMIT 1"
+                ).fetchone()
+                if row is None:
+                    run.outcome = "no_action_needed"
+                    run.detail = "no brief_runs row"
+                    return "No brief found \u2014 send the morning brief first."
+
+                brief_id, item_ids = row[0], row[1]
+                max_idx = len(item_ids)
+
+                out_of_range = [i for i in indices if i < 1 or i > max_idx]
+                valid = [i for i in indices if 1 <= i <= max_idx]
+
+                marked: list[str] = []
+                for idx in valid:
+                    item_id = item_ids[idx - 1]
+                    item_row = conn.execute(
+                        "SELECT title, raw_content, task_status FROM items WHERE id = %s",
+                        (item_id,),
+                    ).fetchone()
+                    if item_row is None:
+                        continue
+                    title, raw_content, task_status = item_row
+                    name = (title or raw_content or "").strip()[:80]
+                    if task_status == "done":
+                        marked.append(f"{name} (already done)")
+                        continue
+                    conn.execute(
+                        "UPDATE items SET task_status='done', completed_at=now() WHERE id = %s",
+                        (item_id,),
+                    )
+                    conn.execute(
+                        "INSERT INTO job_queue (job_type, payload) VALUES ('graph_invoke', %s)",
+                        (json.dumps({"item_id": item_id, "content": "/plan", "source": "system"}),),
+                    )
+                    # project activity — best-effort inline
+                    try:
+                        subcategory = conn.execute(
+                            "SELECT subcategory FROM items WHERE id = %s", (item_id,)
+                        ).fetchone()
+                        if subcategory and subcategory[0]:
+                            proj = conn.execute(
+                                "SELECT id FROM projects WHERE alias = %s AND status = 'active'",
+                                (subcategory[0],),
+                            ).fetchone()
+                            if proj:
+                                conn.execute(
+                                    """INSERT INTO project_activity
+                                           (project_id, event_type, item_id, summary)
+                                       VALUES (%s, 'task_done', %s, %s)""",
+                                    (str(proj[0]), item_id, f"Completed: {name[:120]}"),
+                                )
+                    except Exception:
+                        logger.warning("project_activity failed in /done", exc_info=True)
+                    marked.append(f"\u2705 {name}")
+
+                conn.commit()
+
+            parts: list[str] = []
+            if marked:
+                parts.append("\n".join(marked))
+            if out_of_range:
+                parts.append(f"Index out of range (expected 1\u2013{max_idx}): {', '.join(str(i) for i in out_of_range)}")
+
+            run.outcome = "acted" if any(not m.endswith("(already done)") for m in marked) else "no_action_needed"
+            run.detail = f"indices={indices} brief={brief_id}"
+            return "\n".join(parts) if parts else "Nothing to mark."
+
+        except Exception:
+            logger.exception("/done handler failed")
+            run.outcome = "failed"
+            return "Error marking items done."
+
+
 def personal_agent_node(state: GraphState) -> dict:
     """
     Sole entry point. Two modes:
@@ -483,6 +576,13 @@ def personal_agent_node(state: GraphState) -> dict:
         _log_route("echo_agent", f"route_slash_unknown:people:{subcommand}",
                    f"/people {subcommand!r} not a known subcommand", item_id=item_id)
         return {"routed_to": "echo"}
+
+    # /done <n>... — mark brief items done by index, no LLM, no specialist.
+    if alias == "done":
+        reply = _handle_done(raw, state.get("source", ""))
+        _write_outbox_direct(state.get("source", ""), reply)
+        _log_decision("personal_agent", "slash_done", reply[:200], item_id=item_id)
+        return {"routed_to": None, "specialist_result": {"handled": "done"}}
 
     if alias is not None:
         # /plan <text> → split on commas, capture each fragment, then schedule as normal.

@@ -119,7 +119,7 @@ _LEARNED_RE = re.compile(r"#learned\b", re.IGNORECASE)
 # picks it up automatically. Never include embedding vectors or tsvectors.
 # ---------------------------------------------------------------------------
 _ITEM_CORE     = "id, title, raw_content, ai_summary, category, created_at"
-_ITEM_TASK     = "task_status, task_deadline, task_progress, plan_bucket, plan_order, plan_date, rollover_note"
+_ITEM_TASK     = "task_status, task_deadline, task_progress, plan_bucket, plan_order, plan_date, rollover_note, completed_at"
 _ITEM_TIME     = "starts_at, ends_at, is_event, time_inferred"
 _ITEM_NOTEBOOK = "notebook_id, section_id, learned"
 _ITEM_CAPTURE  = (
@@ -991,7 +991,7 @@ async def get_item(item_id: str):
 async def update_item(item_id: str, updates: dict):
     allowed = {"category", "subcategory", "ai_tags", "task_status",
                "task_deadline", "task_progress", "plan_bucket",
-               "plan_order", "plan_date", "rollover_note",
+               "plan_order", "plan_date", "rollover_note", "completed_at",
                "status", "reviewed", "raw_content", "ai_summary",
                "section_id", "notebook_id"}
     filtered = {k: v for k, v in updates.items() if k in allowed}
@@ -1149,6 +1149,7 @@ async def get_agent_today():
         supabase.table("items").select("id", count="exact")
         .eq("plan_bucket", "today").eq("action_class", "task")
         .eq("status", "active").eq("task_status", "done")
+        .gte("completed_at", today_start)
         .execute()
     )
     r_captures = (
@@ -1211,12 +1212,14 @@ async def get_dashboard_summary():
         supabase.table("items").select("id", count="exact")
         .eq("plan_bucket", "today").eq("action_class", "task")
         .eq("status", "active").eq("task_status", "done")
+        .gte("completed_at", today_start)
         .execute()
     )
-    # neq silently drops NULLs in PostgREST — use or_ to include null/pending/in_progress
+    # Include done items so completed tasks don't vanish from the plan tile;
+    # completed_at lets the renderer mark them ✅.
     r_next_up = (
         supabase.table("items")
-        .select("id,title,ai_summary,plan_order,task_status")
+        .select("id,title,ai_summary,plan_order,task_status,completed_at")
         .eq("plan_bucket", "today").eq("action_class", "task").eq("status", "active")
         .or_("task_status.is.null,task_status.eq.pending,task_status.eq.in_progress")
         .order("plan_order").limit(1)
@@ -3000,3 +3003,70 @@ async def kill_build(approval_id: str):
             r.raise_for_status()
 
     return {"killed": True, "branch": branch}
+
+
+# ---------------------------------------------------------------------------
+# Brief completion
+# ---------------------------------------------------------------------------
+
+@app.post("/brief/{brief_id}/complete/{idx}", dependencies=[Depends(verify_api_key)])
+async def complete_brief_item(brief_id: int, idx: int):
+    """Mark a brief item done by 1-based index.  409 if already done."""
+    with psycopg.connect(_db_url()) as conn:
+        row = conn.execute(
+            "SELECT item_ids FROM brief_runs WHERE id = %s",
+            (brief_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "brief not found")
+        item_ids: list[str] = row[0]
+        if idx < 1 or idx > len(item_ids):
+            raise HTTPException(400, f"index out of range: expected 1\u2013{len(item_ids)}")
+        item_id = item_ids[idx - 1]
+
+        status_row = conn.execute(
+            "SELECT task_status FROM items WHERE id = %s", (item_id,)
+        ).fetchone()
+        if status_row and status_row[0] == "done":
+            raise HTTPException(409, "already done")
+
+        conn.execute(
+            "UPDATE items SET task_status='done', completed_at=now() WHERE id = %s",
+            (item_id,),
+        )
+        conn.execute(
+            "INSERT INTO job_queue (job_type, payload) VALUES ('graph_invoke', %s)",
+            (json.dumps({"item_id": item_id, "content": "/plan", "source": "system"}),),
+        )
+        conn.commit()
+
+    # Best-effort project activity — same logic as update_item side effect.
+    try:
+        _record_project_activity_task_done(item_id)
+    except Exception:
+        logger.warning("project_activity task_done record failed (brief complete)",
+                       extra={"ctx": {"item_id": item_id}}, exc_info=True)
+
+    # Return all brief items in original order for re-render.
+    with psycopg.connect(_db_url()) as conn:
+        rows = conn.execute(
+            """SELECT id, title, raw_content, starts_at, time_inferred, task_status
+                 FROM items WHERE id = ANY(%s::uuid[])""",
+            (item_ids,),
+        ).fetchall()
+    by_id = {str(r[0]): r for r in rows}
+    ordered = [by_id[iid] for iid in item_ids if iid in by_id]
+    return {
+        "brief_id": brief_id,
+        "items": [
+            {
+                "id": str(r[0]),
+                "title": r[1],
+                "raw_content": r[2],
+                "starts_at": r[3].isoformat() if r[3] else None,
+                "time_inferred": r[4],
+                "task_status": r[5],
+            }
+            for r in ordered
+        ],
+    }
