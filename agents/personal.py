@@ -84,7 +84,10 @@ def _resolve_calendar_conflict(
             chat_row  = conn.execute(
                 "SELECT metadata->>'chat_id' FROM items WHERE id = %s", (item_id,)
             ).fetchone() if item_id else None
-            recipient = str(chat_row[0]) if chat_row and chat_row[0] else source
+            raw_recipient = str(chat_row[0]) if chat_row and chat_row[0] else source
+            recipient = _resolve_recipient(raw_recipient)
+            if recipient is None:
+                return "error"
 
             if answer == "keep":
                 conn.execute(
@@ -215,7 +218,29 @@ def _get_pending_conflicts() -> list[dict]:
         return []
 
 
-def _write_outbox_direct(recipient: str, message: str) -> None:
+def _resolve_recipient(source: str) -> str | None:
+    """Return a deliverable Telegram chat ID or None.
+
+    A numeric string (possibly negative) is already a chat ID — pass through.
+    The literal string 'telegram' is a channel name, not an ID — resolve via env.
+    If resolution fails, log an error and return None so the caller skips the write.
+    """
+    if source and source.lstrip("-").isdigit():
+        return source
+    cid = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if cid:
+        return cid
+    logger.error(
+        "Cannot resolve Telegram recipient: source=%r and TELEGRAM_CHAT_ID unset — skipping outbox write",
+        source,
+    )
+    return None
+
+
+def _write_outbox_direct(source: str, message: str) -> None:
+    recipient = _resolve_recipient(source)
+    if recipient is None:
+        return
     url = _db_url()
     if not url:
         return

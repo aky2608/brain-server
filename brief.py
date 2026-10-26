@@ -88,6 +88,7 @@ def _section_rollovers(conn: psycopg.Connection) -> list[str]:
             WHERE status = 'active'
               AND plan_bucket = 'today'
               AND rollover_note IS NOT NULL
+              AND task_status IS DISTINCT FROM 'done'
             ORDER BY plan_order NULLS LAST""",
     ).fetchall()
     if not rows:
