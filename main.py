@@ -909,8 +909,11 @@ async def capture(data: CaptureInput):
     }
     if data.category:
         insert_payload["category"] = data.category
-    elif shortcut and shortcut.get("category"):
-        insert_payload["category"] = shortcut["category"]
+    elif shortcut:
+        # Shortcuts with an explicit category (e.g. notebook → learning) keep it;
+        # command-only shortcuts (/watch, /done, /echo, etc.) get 'shortcut' so
+        # they don't pollute category='thoughts' queries.
+        insert_payload["category"] = shortcut.get("category") or "shortcut"
     if data.title:
         insert_payload["title"] = data.title
     if data.notebook_id:

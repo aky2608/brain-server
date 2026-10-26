@@ -237,6 +237,27 @@ def _resolve_recipient(source: str) -> str | None:
     return None
 
 
+def _mark_shortcut_classified(item_id: Optional[str]) -> None:
+    """Stamp classification_status='done', category='shortcut' on an item that was handled
+    as an interactive command (conflict reply, calendar reply) rather than a real capture.
+    Prevents the batch loop from wasting an LLM call classifying it as 'thoughts'.
+    """
+    if not item_id:
+        return
+    url = _db_url()
+    if not url:
+        return
+    try:
+        with psycopg.connect(url) as conn:
+            conn.execute(
+                "UPDATE items SET classification_status = 'done', category = 'shortcut' WHERE id = %s",
+                (item_id,),
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("_mark_shortcut_classified failed for %s", item_id)
+
+
 def _write_outbox_direct(source: str, message: str) -> None:
     recipient = _resolve_recipient(source)
     if recipient is None:
@@ -493,6 +514,7 @@ def personal_agent_node(state: GraphState) -> dict:
     if m:
         pending = _get_pending_conflicts()
         if pending:
+            _mark_shortcut_classified(item_id)
             answer = m.group(1).lower()
             code   = m.group(2).lower() if m.group(2) else None
             if code:
@@ -534,6 +556,7 @@ def personal_agent_node(state: GraphState) -> dict:
     if m_cal:
         pending_cal = _get_pending_calendar_conflicts()
         if pending_cal:
+            _mark_shortcut_classified(item_id)
             verb      = m_cal.group(1).lower()
             rest      = m_cal.group(2).strip()
             src       = state.get("source", "")

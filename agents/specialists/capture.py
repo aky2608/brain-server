@@ -227,6 +227,20 @@ class CaptureAgent(BaseAgent):
 
         cls = _classify(input.raw, input.source, input.capture_type)
 
+        if cls is None:
+            _mark_classify_failed(input.capture_uuid)
+            return CaptureOutput(
+                item_id=input.capture_uuid,
+                category="unknown",
+                shadow=False,
+                decisions=[{
+                    "agent_name": "capture_agent",
+                    "action_taken": "classify:failed",
+                    "reason": "primary and fallback LLM calls both failed — classification_status set to failed for retry",
+                    "interrupt_tier": "log_only",
+                }],
+            )
+
         # Regex pre-pass: deterministic extraction wins; LLM date_phrase is the fallback.
         _regex_phrase = _extract_date_phrase(input.raw)
         if _regex_phrase:
@@ -733,7 +747,7 @@ def _call_1minai_sync(prompt: str, model: str) -> str:
     return r.json()["aiRecord"]["aiRecordDetail"]["resultObject"][0]
 
 
-def _classify(raw: str, source: str, capture_type: str) -> dict:
+def _classify(raw: str, source: str, capture_type: str) -> Optional[dict]:
     prompt = _build_prompt(raw, source, capture_type, datetime.now(_IST))
     try:
         resp = _call_1minai_sync(prompt, _ONEMIN_MODEL)
@@ -743,14 +757,51 @@ def _classify(raw: str, source: str, capture_type: str) -> dict:
             resp = _call_1minai_sync(prompt, _FALLBACK_MODEL)
         except Exception:
             logger.error("classify fallback also failed", exc_info=True)
-            return {"category": "thoughts", "action_class": "record", "tags": [], "summary": ""}
+            return None
 
     clean = re.sub(r"```(?:json)?\n?", "", resp).strip().strip("`")
     try:
         return json.loads(clean)
     except json.JSONDecodeError:
         logger.error("classify JSON parse failed: %r", clean[:200])
-        return {"category": "thoughts", "action_class": "record", "tags": [], "summary": ""}
+        return None
+
+
+def _mark_classify_failed(item_id: str) -> None:
+    """Set classification_status='failed' so the batch retry loop picks it up.
+
+    Sends a one-time outbox alert when the 3rd failure in 30 min is detected,
+    signalling a sustained API outage rather than a transient error.
+    """
+    url = os.environ.get("BRAIN_DB_URL", "")
+    if not url:
+        return
+    try:
+        with psycopg.connect(url) as conn:
+            conn.execute(
+                "UPDATE items SET classification_status = 'failed' WHERE id = %s",
+                (item_id,),
+            )
+            row = conn.execute(
+                """SELECT COUNT(*) FROM items
+                    WHERE classification_status = 'failed'
+                      AND created_at > now() - interval '30 minutes'""",
+            ).fetchone()
+            recent_failures = int(row[0]) if row else 0
+            if recent_failures == 3:
+                cid = os.environ.get("TELEGRAM_CHAT_ID", "")
+                if cid:
+                    conn.execute(
+                        "INSERT INTO outbox (channel, recipient, message) VALUES ('telegram', %s, %s)",
+                        (cid,
+                         f"classify outage: {recent_failures} items failed in 30 min "
+                         "— 1min.ai API may be down or key invalid"),
+                    )
+                else:
+                    logger.error("classify outage threshold reached but TELEGRAM_CHAT_ID unset — alert suppressed")
+            conn.commit()
+    except Exception:
+        logger.exception("_mark_classify_failed DB write failed for %s", item_id)
 
 
 # ---------------------------------------------------------------------------

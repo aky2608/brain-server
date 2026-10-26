@@ -14,7 +14,7 @@ Date and event rules:
 Return exactly this structure:
 {{
   "category": "learning|thoughts|work|life|resources|health",
-  "subcategory": "wayclear|accrediq|finance|quotes|grocery|tech|hacks|music|null",
+  "subcategory": "finance (ANY amount paid/received, regardless of purpose) | wayclear (WayClear product work) | accrediq (Veridh/IRC accreditation work only, not payments) | quotes | grocery | tech | hacks | music | null",
   "tags": ["tag1", "tag2", "tag3"],
   "summary": "under 50 words",
   "action_class": "record|task|agent|alert|build",
@@ -24,3 +24,4 @@ Return exactly this structure:
 
 Context: User is Ashish, solo founder building WayClear (road safety) and AccredIQ (IRC accreditation).
 SMS debits = life/finance. WhatsApp = life/people. URLs = resources. Tasks/todos = work.
+subcategory null must be JSON null, never the string "null".

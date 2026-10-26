@@ -130,13 +130,26 @@ class FinanceAgent(BaseAgent):
         category = extracted.get("category")
         date_str = extracted.get("date")
 
-        try:
-            tx_date = date.fromisoformat(date_str) if date_str else None
-        except ValueError:
-            tx_date = None
+        authoritative_date, created_date = _item_tx_date(input.item_id)
 
-        if tx_date is None:
-            tx_date = _item_created_date(input.item_id)
+        # Use the item's authoritative date (starts_at → created_at) rather than the
+        # model's date_str.  The model is only consulted as a last resort when the item
+        # has no starts_at, and even then only for month/day — the year is clamped to
+        # created_at's year to prevent the LLM defaulting bare dates to a past year.
+        tx_date = authoritative_date
+        if date_str and authoritative_date == created_date:
+            # starts_at was absent; try to use the model's day/month on the correct year
+            try:
+                parsed = date.fromisoformat(date_str)
+                if parsed.year < created_date.year - 1:
+                    logger.warning(
+                        "finance_agent: model date %s is >1 year before capture %s — clamping year to %s",
+                        parsed, created_date, created_date.year,
+                    )
+                    parsed = parsed.replace(year=created_date.year)
+                tx_date = parsed
+            except ValueError:
+                pass  # leave tx_date = created_date
 
         tx_id = _write_transaction(
             item_id=input.item_id,
@@ -219,20 +232,31 @@ def _db_url() -> str:
     return os.environ.get("BRAIN_DB_URL", "")
 
 
-def _item_created_date(item_id: str) -> date:
+def _item_tx_date(item_id: str) -> tuple[date, date]:
+    """Return (authoritative_date, created_at_date) for the item.
+
+    authoritative_date: starts_at if set (capture already resolved it deterministically),
+    otherwise created_at. This is the preferred transaction date — no LLM date parsing needed.
+    created_at_date is returned separately so callers can clamp a model-supplied year.
+    """
     url = _db_url()
+    today = date.today()
     if not url:
-        return date.today()
+        return today, today
     try:
         with psycopg.connect(url) as conn:
             row = conn.execute(
-                "SELECT created_at FROM items WHERE id = %s", (item_id,)
+                "SELECT starts_at, created_at FROM items WHERE id = %s", (item_id,)
             ).fetchone()
             if row:
-                return row[0].date()
+                starts_at, created_at = row
+                created_date = created_at.date() if created_at else today
+                if starts_at:
+                    return starts_at.date(), created_date
+                return created_date, created_date
     except Exception:
-        logger.warning("finance_agent: could not fetch item created_at", exc_info=True)
-    return date.today()
+        logger.warning("finance_agent: could not fetch item dates", exc_info=True)
+    return today, today
 
 
 def _write_transaction(
