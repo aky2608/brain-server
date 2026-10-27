@@ -21,14 +21,9 @@ import httpx
 import psycopg
 
 from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowModel
+from constants import ONEMIN_PRIMARY_MODEL as _ONEMIN_MODEL, ONEMIN_FALLBACK_MODEL as _FALLBACK_MODEL
 
 logger = logging.getLogger("brain")
-
-# Claude models are not supported for UNIFY_CHAT_WITH_AI on this 1min.ai account/plan —
-# confirmed via direct API testing. Both models below are verified working.
-# ⚠ gpt-4.1-nano deprecationDate: 2026-10-21 — replace fallback before that date.
-_ONEMIN_MODEL = "gpt-4o-mini"
-_FALLBACK_MODEL = "gpt-4.1-nano"
 
 # Recurrence detection thresholds
 _RECURRENCE_MIN_OCCURRENCES = 3   # need at least this many same-merchant rows

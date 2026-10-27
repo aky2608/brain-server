@@ -74,11 +74,7 @@ supabase: Client = create_client(
 )
 
 ACTIVE_SOURCES = {"app_voice", "app_text", "app_share", "app_photo", "web_upload", "web_console", "telegram"}
-# Claude models are not supported for UNIFY_CHAT_WITH_AI on this 1min.ai account/plan —
-# confirmed via direct API testing. Both models below are verified working.
-# ⚠ gpt-4.1-nano deprecationDate: 2026-10-21 — replace fallback before that date.
-ONEMIN_MODEL = "gpt-4o-mini"
-FALLBACK_MODEL = "gpt-4.1-nano"
+from constants import ONEMIN_PRIMARY_MODEL as ONEMIN_MODEL, ONEMIN_FALLBACK_MODEL as FALLBACK_MODEL
 
 # Agent registry — trigger types and intervals are facts about the running system, not inferred.
 # loop: runs on a fixed async interval. reactive: fires on capture/route. manual: slash alias only.

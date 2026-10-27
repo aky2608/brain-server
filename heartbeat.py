@@ -16,8 +16,10 @@ import os
 import sys
 from datetime import timedelta
 
+import httpx
 import psycopg
 
+from constants import ONEMIN_PRIMARY_MODEL, ONEMIN_FALLBACK_MODEL
 from db.agent_runs import record_run
 
 # Alert threshold = roughly 2× each component's run interval.
@@ -117,6 +119,32 @@ def _check_outbox_stuck(conn: psycopg.Connection) -> list[str]:
     return []
 
 
+def _probe_model(model: str) -> str | None:
+    """Return error string if model is unreachable, else None."""
+    try:
+        r = httpx.post(
+            f"{os.environ['ONEMIN_API_URL']}/api/chat-with-ai",
+            headers={"API-KEY": os.environ["ONEMIN_API_KEY"], "Content-Type": "application/json"},
+            json={"type": "UNIFY_CHAT_WITH_AI", "model": model, "promptObject": {"prompt": "ping"}},
+            timeout=15,
+        )
+        r.raise_for_status()
+        return None
+    except Exception as e:
+        return str(e)
+
+
+def _check_models(conn: psycopg.Connection) -> list[str]:
+    issues = []
+    for model, label in ((ONEMIN_PRIMARY_MODEL, "onemin_primary"), (ONEMIN_FALLBACK_MODEL, "onemin_fallback")):
+        err = _probe_model(model)
+        if err:
+            reason = f"{model} returned error: {err[:120]}"
+            if _alert_if_new(conn, label, reason):
+                issues.append(f"{label}: {reason}")
+    return issues
+
+
 def _check_job_queue_stuck(conn: psycopg.Connection) -> list[str]:
     count = conn.execute(
         """SELECT count(*) FROM job_queue
@@ -138,6 +166,7 @@ def main() -> None:
             issues += _check_components(conn)
             issues += _check_outbox_stuck(conn)
             issues += _check_job_queue_stuck(conn)
+            issues += _check_models(conn)
             conn.commit()
 
         if issues:

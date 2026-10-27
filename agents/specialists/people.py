@@ -23,11 +23,9 @@ import psycopg
 import psycopg.errors
 
 from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowModel
+from constants import ONEMIN_PRIMARY_MODEL as _ONEMIN_MODEL, ONEMIN_FALLBACK_MODEL as _FALLBACK_MODEL
 
 logger = logging.getLogger("brain")
-
-_ONEMIN_MODEL = "gpt-4o-mini"
-_FALLBACK_MODEL = "gpt-4.1-nano"
 
 _HIGH_SIM = 0.85
 _LOW_SIM  = 0.50

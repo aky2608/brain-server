@@ -25,15 +25,10 @@ from psycopg.types.json import Jsonb
 from constants import EVENT_DEFAULT_MINUTES
 
 from agents.base import BaseAgent, CostTier, GraphState, InterruptTier, NarrowModel
+from constants import ONEMIN_PRIMARY_MODEL as _ONEMIN_MODEL, ONEMIN_FALLBACK_MODEL as _FALLBACK_MODEL
 from shortcuts import parse_slash
 
 logger = logging.getLogger("brain")
-
-# Claude models are not supported for UNIFY_CHAT_WITH_AI on this 1min.ai account/plan —
-# confirmed via direct API testing. Both models below are verified working.
-# ⚠ gpt-4.1-nano deprecationDate: 2026-10-21 — replace fallback before that date.
-_ONEMIN_MODEL = "gpt-4o-mini"
-_FALLBACK_MODEL = "gpt-4.1-nano"
 _EMBED_MODEL = "gemini-embedding-001"
 _EMBED_DIMS = 1536  # matches vector(1536) column; truncated from model's native 3072 via outputDimensionality
 
